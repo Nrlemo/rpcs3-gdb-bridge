@@ -156,7 +156,9 @@ class Gdb:
         r = self.cmd(f"M{addr:x},{len(data):x}:" + binascii.hexlify(data).decode())
         return r == "OK"
 
-    CHUNK = 1 << 20  # el servidor no limita `m`; con coste fijo por paquete, bloques grandes
+    # El servidor no limita `m`. Medido contra RPCS3 0.0.43: 4 KiB ~0,1 MiB/s, 64-256 KiB ~28 MiB/s,
+    # 1 MiB ~17 MiB/s, 4 MiB ~6,6 MiB/s. El óptimo está en 256 KiB.
+    CHUNK = 256 << 10
 
     def chunk(self) -> int:
         return self.CHUNK
