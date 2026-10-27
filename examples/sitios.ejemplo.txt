@@ -1,0 +1,5 @@
+# Ejemplo de archivo de sitios para bp_probe.py (las direcciones son de ejemplo: use las de su programa).
+# Formato: 0xVA [nombre]; '#' comenta. Cada VA debe ser un stb/lbz rX,D(rA) o un ld rD,DS(rA): se decodifica del ELF y,
+# si es otra instrucción, bp_probe.py aborta.
+0x20010 escritura_campo      # stb r5,D(r28): quién escribe el campo y con qué valor
+0x20100 lectura_registro     # ld r22,0x50(r3): r3 apunta a un registro de configuración
