@@ -14,7 +14,7 @@ Al final, resumen con impactos/s y latencia por ciclo (para decidir entre `Z0` y
 Uso (con el proxy en marcha y el juego corriendo; ver docs/puente_rpcs3.md):
   python3 -I tools/rpcs3_bridge/bp_probe.py --elf work/eboot/EBOOT.elf --sites sitios.txt --out salida.jsonl
       --log <RPCS3.log> [--thread <id_hex>] [--route tests/rutas/R2.json --route-log <salida>/route.log]
-      [--label-file etiqueta.txt] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
+      [--label-file etiqueta.txt] [--keep-after-route] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
 `sitios.txt`: una línea por sitio, `0xVA [nombre]`; `#` comenta. La salida no debe existir. Si un sitio no es `stb`/`lbz` con
 desplazamiento 0xd4, aborta. No cierra la conexión del proxy; al terminar quita sus `Z0` y deja el juego corriendo.
 """
@@ -183,6 +183,8 @@ class Probe:
             tid_hit, r = self.find_hit_thread()
             self.select(self.tid)
             if tid_hit is None:
+                self.emit({"t": round(time.time() - self.t0, 3), "evento": "parada_sin_sitio", "pc": hex(r.get("pc", 0)),
+                           "lr": hex(r.get("lr", 0)), "hilo_juego": self.tid})
                 return False
             self.select(tid_hit)
         pc = r["pc"]
@@ -259,6 +261,7 @@ def main(argv):
     ap.add_argument("--thread")
     ap.add_argument("--route")
     ap.add_argument("--route-log")
+    ap.add_argument("--keep-after-route", action="store_true", help="no parar cuando la ruta termina (seguir hasta --duration o una señal)")
     ap.add_argument("--label-file", help="etiqueta manual (primera línea del archivo), alternativa a --route")
     ap.add_argument("--duration", type=float, default=600.0)
     ap.add_argument("--max-bps", type=int, default=8)
@@ -294,18 +297,19 @@ def main(argv):
         deadline = time.time() + a.duration
         reason = "duracion"
         stop_req = []
+        route_over = lambda: bool(label and not a.keep_after_route and label.finished())
         # SIGINT/SIGTERM piden una parada ordenada (quitar los Z0 antes de salir); una shell no interactiva deja SIGINT ignorado
         for sg in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sg, lambda *_: stop_req.append(1))
         try:
             while time.time() < deadline and not stop_req:
-                if label and label.finished():
+                if route_over():
                     reason = "ruta_terminada"
                     break
                 t_c = time.time()
                 g.cont()
                 stop = None
-                while time.time() < deadline and not stop_req and not (label and label.finished()):
+                while time.time() < deadline and not stop_req and not route_over():
                     try:
                         stop = g.wait_stop(timeout=2.0)
                         break
@@ -314,7 +318,7 @@ def main(argv):
                 if stop is None:
                     if stop_req:
                         reason = "senal"
-                    elif label and label.finished():
+                    elif route_over():
                         reason = "ruta_terminada"
                     g.interrupt(timeout=20.0)
                     break
