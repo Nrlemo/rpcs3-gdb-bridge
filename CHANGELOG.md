@@ -1,6 +1,6 @@
 # Cambios
 
-## Sin publicar (preparado como v0.1.0, sin etiquetar)
+## v0.1.0 (2026-10-27)
 - Proxy RSP persistente y servidor simulado (`proxy.py`, `mock_rsp.py`).
 - Cliente RSP (`gdbrsp.py`) y sesión persistente (`dbg_session.py`).
 - Sondeo con `Z0` (`bp_probe.py`): sitios `stb`/`lbz`/`ld`, filtro opcional por vtable, vigía contra paradas silenciosas (por defecto 5 s), volcados, etiquetas de ruta.
