@@ -126,7 +126,7 @@ class TestImpactos(unittest.TestCase):
     """Probe.handle_hit con un Gdb simulado."""
 
     def setUp(self):
-        code = struct.pack(">II", 0x98000000 | (5 << 21) | (28 << 16) | 0xD4, 0)       # stb r5,0xd4(r28)
+        code = struct.pack(">II", 0x98000000 | (5 << 21) | (28 << 16) | 0x24, 0)       # stb r5,0x24(r28)
         self.img = opd_scan.Image([(0x20010, code)], [(0x20010, 0x20018)])
         self.sites = {0x20010: {"va": 0x20010, "name": "w_sitio", **bp.decode_site(self.img, 0x20010)}}
         self.mem = {}
@@ -251,7 +251,7 @@ class TestVigia(unittest.TestCase):
         self.assertEqual(bp.wait_stop_or_watchdog(G(), time.time(), 5.0, time.time() + 5, lambda: False), ("S05", None))
 
     def _probe(self, g):
-        code = struct.pack(">II", 0x98000000 | (5 << 21) | (28 << 16) | 0xD4, 0)       # stb r5,0xd4(r28)
+        code = struct.pack(">II", 0x98000000 | (5 << 21) | (28 << 16) | 0x24, 0)       # stb r5,0x24(r28)
         img = opd_scan.Image([(0x20010, code)], [(0x20010, 0x20018)])
         sites = {0x20010: {"va": 0x20010, "name": "w", **bp.decode_site(img, 0x20010)}}
         out = io.StringIO()
@@ -308,7 +308,7 @@ class TestGeneral(unittest.TestCase):
         img = _img([STB_R5_10_R28])
         self.assertEqual(bp.decode_site(img, 0x20010, field_offset=0x10)["off"], 0x10)
         with self.assertRaises(ValueError):
-            bp.decode_site(img, 0x20010, field_offset=0xD4)
+            bp.decode_site(img, 0x20010, field_offset=0x24)
 
     def test_sin_object_vtable_todo_impacto_coincide_y_no_se_lee_el_objeto(self):
         img = _img([STB_R5_10_R28])
@@ -327,7 +327,7 @@ class TestGeneral(unittest.TestCase):
         sites = {0x20010: {"va": 0x20010, "name": "s", **bp.decode_site(img, 0x20010)}}
         mem = {}
         put(mem, 0x30000010, bytes([0x7B]))                  # obj + 0x10
-        put(mem, 0x300000D4, bytes([0x01]))                  # obj + 0xd4: NO debe leerse
+        put(mem, 0x30000024, bytes([0x01]))                  # obj + 0x24: NO debe leerse
         g = FakeGdb(mem, [{"pc": 0x20010, "lr": 1, "r28": 0x30000000, "r1": 0x1000}])
         out = io.StringIO()
         p = bp.Probe(g, img, sites, "0000000001000001", out)
@@ -347,8 +347,8 @@ class TestGeneral(unittest.TestCase):
     def test_parser_nuevas_opciones(self):
         a = bp.build_parser().parse_args(["--elf", "e", "--sites", "s", "--out", "o"])
         self.assertEqual((a.thread_name, a.object_vtable, a.field_offset), ("GameThread", None, None))
-        a = bp.build_parser().parse_args(["--elf", "e", "--sites", "s", "--out", "o", "--thread-name", "X", "--object-vtable", "0x1234", "--field-offset", "0xd4"])
-        self.assertEqual((a.thread_name, a.object_vtable, a.field_offset), ("X", 0x1234, 0xD4))
+        a = bp.build_parser().parse_args(["--elf", "e", "--sites", "s", "--out", "o", "--thread-name", "X", "--object-vtable", "0x1234", "--field-offset", "0x24"])
+        self.assertEqual((a.thread_name, a.object_vtable, a.field_offset), ("X", 0x1234, 0x24))
 
 
 if __name__ == "__main__":
