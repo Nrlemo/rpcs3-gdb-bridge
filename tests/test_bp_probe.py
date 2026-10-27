@@ -77,6 +77,10 @@ class TestEboot(unittest.TestCase):
         self.assertEqual(bp.decode_site(self.img, 0xA14CCC), {"kind": "lbz", "reg": 30, "ra": 31})   # el sitio de patch_trace.py
         self.assertEqual(bp.decode_site(self.img, 0x571FC), {"kind": "stb", "reg": 5, "ra": 3})
 
+    def test_decode_ld_de_rec(self):
+        self.assertEqual(bp.decode_site(self.img, 0x53164), {"kind": "ld", "reg": 22, "ra": 3, "off": 0x50})
+        self.assertEqual(bp.decode_site(self.img, 0x531B8), {"kind": "ld", "reg": 20, "ra": 3, "off": 0x58})
+
     def test_decode_falla_cerrado(self):
         for va in (0x10000, 0x48978, 0x5CD7F0):
             with self.assertRaises(ValueError):
@@ -195,6 +199,28 @@ class TestImpactos(unittest.TestCase):
         e = self.recs()[0]
         self.assertEqual(e["evento"], "vigia_sin_sitio")
         self.assertIn("0001", e["hilos"])
+
+    def test_sitio_ld_con_volcado_y_gpr(self):
+        code = struct.pack(">II", (58 << 26) | (22 << 21) | (3 << 16) | 0x50, 0)          # ld r22,0x50(r3)
+        img = opd_scan.Image([(0x53164, code)], [(0x53164, 0x5316C)])
+        sites = {0x53164: {"va": 0x53164, "name": "rec", **bp.decode_site(img, 0x53164)}}
+        mem = {}
+        put(mem, 0x30001050, struct.pack(">Q", 0x1122334455667788))      # rec+0x50
+        put(mem, 0x30001000, bytes(range(16)))                           # rec[0..16)
+        g = FakeGdb(mem, [{"pc": 0x53164, "lr": 7, "r3": 0x30001000, "r1": 0x1000, "r31": 0x31}])
+        p = bp.Probe(g, img, sites, "0000000001000006", self.out, dumps=bp.parse_dumps(["ra:0:16"]), all_regs=True)
+        self.assertTrue(p.handle_hit(0.0))
+        r = self.recs()[0]
+        self.assertEqual(r["val"], "0x1122334455667788")
+        self.assertEqual(r["dump"]["ra:0:16"], {"base": "0x30001000", "hex": bytes(range(16)).hex()})
+        self.assertEqual(r["gpr"]["r31"], "0x31")
+        self.assertTrue(r["is_font"])
+
+    def test_parse_dumps_rechaza_registro_invalido(self):
+        for bad in ("r32:0:8", "x3:0:8", "pc:0:8"):
+            with self.assertRaises(ValueError):
+                bp.parse_dumps([bad])
+        self.assertEqual(bp.parse_dumps(["r31:0x10:0x20"]), [("r31:0x10:0x20", "r31", 16, 32)])
 
     def test_tope_por_clave_y_retiro_del_sitio(self):
         g, p = self.probe([{"pc": 0x48974, "lr": 0x5CD7F4, "r28": 0x30068B10, "r5": 1, "r1": 0x1000}], cap_key=2, cap_site=5)

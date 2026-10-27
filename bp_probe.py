@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fase 2 del puente (#20): sondeo con `Z0` de quién escribe/lee `obj+0xd4` (byte de VWF del objeto de fuente).
 
-Pone `Z0` en una lista de instrucciones `stb rS,0xd4(rA)` / `lbz rD,0xd4(rA)` del EBOOT, y en cada parada registra (JSONL):
+Pone `Z0` en una lista de instrucciones `stb rS,0xd4(rA)` / `lbz rD,0xd4(rA)` / `ld rD,DS(rA)` del EBOOT, y en cada parada registra (JSONL):
 PC, LR, el valor que se guarda (`stb`: byte de rS, decodificado de la palabra de instrucción del ELF) o el byte actual (`lbz`, leído
 por `m`), el objeto (rA), si es un objeto de fuente real (`*(u32*)rA == 0xCFB7E8`, la vtable de docs/vwf_estado.md §2e; no depende de
 direcciones fijas), r3..r10, los 3 primeros marcos de la cadena de retroceso (cada `ret` comprobado contra el ELF: la instrucción
@@ -14,7 +14,7 @@ Al final, resumen con impactos/s y latencia por ciclo (para decidir entre `Z0` y
 Uso (con el proxy en marcha y el juego corriendo; ver docs/puente_rpcs3.md):
   python3 -I tools/rpcs3_bridge/bp_probe.py --elf work/eboot/EBOOT.elf --sites sitios.txt --out salida.jsonl
       --log <RPCS3.log> [--thread <id_hex>] [--route tests/rutas/R2.json --route-log <salida>/route.log]
-      [--label-file etiqueta.txt] [--keep-after-route] [--watchdog 20] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
+      [--label-file etiqueta.txt] [--keep-after-route] [--watchdog 20] [--dump ra:0:0x80]... [--all-regs] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
 `sitios.txt`: una línea por sitio, `0xVA [nombre]`; `#` comenta. La salida no debe existir. Si un sitio no es `stb`/`lbz` con
 desplazamiento 0xd4, aborta. No cierra la conexión del proxy; al terminar quita sus `Z0` y deja el juego corriendo.
 """
@@ -40,12 +40,13 @@ BL_LIKE = (0x4E800421, 0x4E800021)      # bctrl, blrl
 
 
 def decode_site(img, va):
-    """Decodifica `stb rS,0xd4(rA)` o `lbz rD,0xd4(rA)` de la palabra de instrucción del ELF. Falla cerrado."""
+    """Decodifica del ELF `stb rS,0xd4(rA)`, `lbz rD,0xd4(rA)` o `ld rD,DS(rA)` (forma DS, DS cualquiera). Falla cerrado."""
     w = img.u32(va)
-    if w is None or (w & 0xFFFF) != 0xD4 or (w >> 26) not in (34, 38):
-        raise ValueError("0x%x no es stb/lbz con desplazamiento 0xd4 (palabra %s)" % (va, "%08x" % w if w is not None else None))
-    reg, ra = (w >> 21) & 31, (w >> 16) & 31
-    return {"kind": "stb" if (w >> 26) == 38 else "lbz", "reg": reg, "ra": ra}
+    if w is not None and (w >> 26) in (34, 38) and (w & 0xFFFF) == 0xD4:
+        return {"kind": "stb" if (w >> 26) == 38 else "lbz", "reg": (w >> 21) & 31, "ra": (w >> 16) & 31}
+    if w is not None and (w >> 26) == 58 and (w & 3) == 0:
+        return {"kind": "ld", "reg": (w >> 21) & 31, "ra": (w >> 16) & 31, "off": w & 0xFFFC}
+    raise ValueError("0x%x no es stb/lbz con desplazamiento 0xd4 ni ld (palabra %s)" % (va, "%08x" % w if w is not None else None))
 
 
 def is_call_return(img, ret):
@@ -126,6 +127,16 @@ def find_game_thread(log_path):
     raise RuntimeError("no hay GameThread en %s: pasar --thread" % log_path)
 
 
+def parse_dumps(specs):
+    out = []
+    for sp in specs:
+        rn, off, ln = sp.split(":")
+        if rn != "ra" and not re.fullmatch(r"r(\d|[12]\d|3[01])", rn):
+            raise ValueError("registro inválido en --dump: %s" % rn)
+        out.append((sp, rn, int(off, 0), int(ln, 0)))
+    return out
+
+
 def load_sites(path, img):
     sites = {}
     with open(path, encoding="utf-8") as f:
@@ -143,9 +154,10 @@ def load_sites(path, img):
 
 
 class Probe:
-    def __init__(self, g, img, sites, tid, out, label=None, cap_key=10, cap_site=500):
+    def __init__(self, g, img, sites, tid, out, label=None, cap_key=10, cap_site=500, dumps=(), all_regs=False):
         self.g, self.img, self.sites, self.tid, self.out, self.label = g, img, sites, tid, out, label
         self.cap_key, self.cap_site = cap_key, cap_site
+        self.dumps, self.all_regs = list(dumps), all_regs   # dumps: [(nombre, 'ra'|'rN', desplazamiento, largo)]
         self.keys = Counter()                 # (sitio, lr, val, es_fuente) -> veces
         self.site_hits = Counter()
         self.site_font = Counter()
@@ -200,14 +212,19 @@ class Probe:
         pc = r["pc"]
         s = self.sites[pc]
         obj = r["r%d" % s["ra"]]
-        vt = self.g.read(obj, 4)
-        vtable = struct.unpack(">I", vt)[0] if len(vt) == 4 else None
-        is_font = vtable == FONT_VTABLE
-        if s["kind"] == "stb":
-            val = r["r%d" % s["reg"]] & 0xFF
+        if s["kind"] == "ld":                # el valor que se va a cargar; no hay objeto de fuente que comprobar
+            b = self.g.read(obj + s["off"], 8)
+            val = int.from_bytes(b, "big") if len(b) == 8 else None
+            vtable, is_font = None, True
         else:
-            b = self.g.read(obj + 0xD4, 1)
-            val = b[0] if b else None
+            vt = self.g.read(obj, 4)
+            vtable = struct.unpack(">I", vt)[0] if len(vt) == 4 else None
+            is_font = vtable == FONT_VTABLE
+            if s["kind"] == "stb":
+                val = r["r%d" % s["reg"]] & 0xFF
+            else:
+                b = self.g.read(obj + 0xD4, 1)
+                val = b[0] if b else None
         key = (pc, r["lr"], val, is_font)
         self.keys[key] += 1
         self.site_hits[pc] += 1
@@ -221,11 +238,18 @@ class Probe:
         if log_it:
             rec = {"t": round(time.time() - self.t0, 3), "n": self.n, "label": self.label.current() if self.label else None,
                    "site": hex(pc), "name": s["name"], "kind": s["kind"], "tid": tid_hit, "lr": hex(r["lr"]), "obj": hex(obj),
-                   "is_font": is_font, "vtable": hex(vtable) if vtable is not None else None, "val": val,
+                   "is_font": is_font, "vtable": hex(vtable) if vtable is not None else None, "val": (hex(val) if s["kind"] == "ld" and val is not None else val),
                    "r3_r10": [hex(r["r%d" % i]) for i in range(3, 11)], "r1": hex(r["r1"]),
                    "chain": walk_chain(self.g.read, self.img, r["r1"]), "veces_clave": self.keys[key]}
             if via:
                 rec["via"] = via
+            if self.dumps:
+                rec["dump"] = {}
+                for name, rn, off, ln in self.dumps:
+                    base = r["r%d" % s["ra"]] if rn == "ra" else r[rn]
+                    rec["dump"][name] = {"base": hex(base + off), "hex": self.g.read(base + off, ln).hex()}
+            if self.all_regs:
+                rec["gpr"] = {"r%d" % i: hex(r["r%d" % i]) for i in range(32)}
         # reanudar: quitar el Z0, un paso (en el hilo que paró), reponerlo
         if tid_hit != self.tid:
             self.g.cmd("Hc" + tid_hit)
@@ -277,6 +301,8 @@ def main(argv):
     ap.add_argument("--label-file", help="etiqueta manual (primera línea del archivo), alternativa a --route")
     ap.add_argument("--duration", type=float, default=600.0)
     ap.add_argument("--watchdog", type=float, default=0.0, help="si no hay parada en N s, interrumpir y mirar el PC (detecta un hilo parado en un Z0 sin parada comunicada)")
+    ap.add_argument("--dump", action="append", default=[], help="REG:OFF:LEN (REG = ra del sitio o rN); vuelca memoria en cada registro de impacto")
+    ap.add_argument("--all-regs", action="store_true", help="incluir r0..r31 en cada registro")
     ap.add_argument("--max-bps", type=int, default=8)
     ap.add_argument("--cap-key", type=int, default=10)
     ap.add_argument("--cap-site", type=int, default=500)
@@ -299,7 +325,7 @@ def main(argv):
     g.cmd("Hg" + tid)
     g.cmd("Hc" + tid)
     with open(a.out, "x", encoding="utf-8") as out:
-        p = Probe(g, img, sites, tid, out, label, a.cap_key, a.cap_site)
+        p = Probe(g, img, sites, tid, out, label, a.cap_key, a.cap_site, parse_dumps(a.dump), a.all_regs)
         p.emit({"evento": "inicio", "hilo": tid, "sitios": {hex(v): d for v, d in sites.items()}, "cap_key": a.cap_key, "cap_site": a.cap_site})
         for va in sites:
             if not g.bp(va):
