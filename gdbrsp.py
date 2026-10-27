@@ -116,7 +116,7 @@ class Gdb:
 
     def cont(self):
         """Reanuda la emulación. No espera respuesta (el servidor solo contesta al parar)."""
-        self.drain()
+        # Sin drain(): podría comerse una parada pendiente (docs/depuracion_gdb_rpcs3.md, «Breakpoints»).
         self._send("c")
         self.running = True
 
@@ -125,11 +125,25 @@ class Gdb:
         old = self.s.gettimeout()
         self.s.settimeout(timeout)
         try:
-            r = self._recv_raw().decode("latin1")
-            self.running = False
-            return r
+            while True:
+                r = self._recv_raw().decode("latin1")
+                if r:  # los paquetes vacíos no son la parada: se ignoran
+                    self.running = False
+                    return r
         finally:
             self.s.settimeout(old)
+
+    def step(self, timeout=20.0) -> str:
+        """Ejecuta una instrucción (`s`) y devuelve el paquete de parada. Solo con el emulador detenido."""
+        self._send("s")
+        self.running = True
+        return self.wait_stop(timeout)
+
+    def interrupt(self, timeout=20.0) -> str:
+        """Detiene un objetivo en marcha con 0x03 y devuelve el paquete de parada."""
+        self.s.sendall(b"\x03")
+        self.running = True
+        return self.wait_stop(timeout)
 
     # --- memoria ------------------------------------------------------
     def read(self, addr: int, length: int) -> bytes:
