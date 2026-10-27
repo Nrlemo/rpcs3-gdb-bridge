@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Resuelve llamadores indirectos de una función PS3 (PPC64, 32 bits efectivos) a partir de una imagen de memoria (#20).
+"""Resuelve llamadores indirectos de una función PS3 (PPC64, 32 bits efectivos) a partir de una imagen de memoria.
 
 Una llamada indirecta usa un descriptor de función (OPD): dos u32 consecutivos (código, TOC). Para una función F:
   1. verifica el formato OPD: el TOC sale del OPD de `e_entry` (ELF) o de --toc (obligatorio con --raw) y debe ser el
      segundo campo más frecuente entre los pares (u32 en código, u32 en datos) con >= --min-count (1000) apariciones;
-     si no, ABORTA. Los TOC adicionales con >= --min-count pares a < 1 MiB del principal también se aceptan (el EBOOT usa 0xD5CAA8 y 0xD6CA90);
+     si no, ABORTA. Los TOC adicionales con >= --min-count pares a < 1 MiB del principal también se aceptan (un binario grande puede usar varias bases de TOC);
   2. busca los OPD (F, TOC);
   3. por cada OPD busca (a) u32 == dirección del OPD en datos (vtables, tablas, slots de TOC) y
      (b) direcciones construidas en código: `lis rD,hi` + `addi|ori rD,rD,lo` (con rD como destino o como origen),
@@ -12,10 +12,10 @@ Una llamada indirecta usa un descriptor de función (OPD): dos u32 consecutivos 
 Para cada acierto de datos muestra el contexto (palabras vecinas) y si los vecinos también son OPD válidos (vtable).
 
 Entradas (una de dos):
-  --elf <EBOOT.elf>                      mapea los PT_LOAD (rango de código = segmentos con PF_X)
+  --elf <programa.elf>                   mapea los PT_LOAD (rango de código = segmentos con PF_X)
   --raw <volcado> --base <VA> --code <lo-hi> --toc <r2>   volcado crudo de RAM que empieza en la VA `--base`
 Salida: texto por stdout y, con --json <ruta>, un JSON (la ruta no debe existir). Direcciones en hex.
-  python3 -I tools/opd_scan.py --elf work/eboot/EBOOT.elf --func 0x5cd7f0 [--toc 0xD5CAA8] [--json out.json]
+  python3 -I opd_scan.py --elf programa.elf --func 0x1000 [--toc 0x...] [--json out.json]
 Limitaciones: solo ve lo que hay en la imagen (un ELF estático no trae punteros construidos en runtime; para eso
 hace falta un volcado de RAM); las direcciones construidas se buscan en una ventana de 8 instrucciones.
 """
@@ -128,8 +128,8 @@ def detect_toc(img, toc_hint, min_count):
         raise ScanError("solo %d pares (código, 0x%x) < %d: el formato OPD no se confirma (%s)" % (n, toc, min_count, stat))
     if not top or top[0][0] != toc:
         raise ScanError("0x%x no es el segundo campo más frecuente: %s" % (toc, stat))
-    # Otras bases de TOC: la TOC de PPC64 cubre ±32 KiB, así que un binario grande usa varias (el EBOOT: 0xD5CAA8 y
-    # 0xD6CA90; los hilos del juego corren con r2=0xD6CA90, docs/puente_rpcs3.md Fase 0). Se aceptan las que tienen
+    # Otras bases de TOC: la TOC de PPC64 cubre ±32 KiB, así que un binario grande usa varias (en ejecución, distintos hilos
+    # corren con distinto r2: se comprueba leyendo r2 con el servidor GDB). Se aceptan las que tienen
     # >= min_count pares, no el cero, y cuya base queda a < 1 MiB de la principal.
     others = sorted(k for k, c in cnt.items() if k != toc and k and c >= min_count and abs(k - toc) < (1 << 20))
     stat["other_tocs"] = [[hex(k), cnt[k]] for k in others]

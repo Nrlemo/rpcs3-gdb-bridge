@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""tools/opd_scan.py: imagen sintética (formato, vtable, direcciones construidas, fallo cerrado) y casos conocidos del
-EBOOT real (work/eboot/EBOOT.elf, si existe; docs/vwf_renderizadores.md sesiones 2-3). Uso: python3 -I tests/test_opd_scan.py
+"""opd_scan.py: imagen sintética (formato, vtable, direcciones construidas, fallo cerrado) y ELF sintético generado en los tests.
+Uso: python3 -I tests/test_opd_scan.py
 """
 import os
 import struct
@@ -10,6 +10,8 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+sys.path.insert(0, os.path.join(ROOT, "tests", "fixtures"))
+import build_elf  # noqa: E402
 import opd_scan as o  # noqa: E402
 
 BASE, CODE_END, DATA_END, TOC = 0x10000, 0x11000, 0x12000, 0x11800
@@ -101,46 +103,80 @@ class TestSynthetic(unittest.TestCase):
         self.assertGreater(os.path.getsize(out), 10)
 
 
-ELF = os.path.join(ROOT, "work/eboot/EBOOT.elf")
+class TestElfSintetico(unittest.TestCase):
+    """Image.from_elf y el modo --elf con un ELF generado (sin ningún programa real)."""
+    CODE_LO, DATA_LO, TOC_E = 0x10000, 0x20000, 0x20C00     # el TOC cae dentro del segmento de datos
+    F, F_OPD, VT = 0x10200, 0x20400, 0x20800
 
-
-@unittest.skipUnless(os.path.exists(ELF), "falta work/eboot/EBOOT.elf")
-class TestEbootReal(unittest.TestCase):
     @classmethod
-    def setUpClass(cls):
-        cls.img = o.Image.from_elf(ELF)
-        cls.res = {}
+    def build(cls):
+        code = bytearray(0x1000)
+        data = bytearray(0x1000)
 
-    def scan(self, f):
-        if f not in self.res:
-            self.res[f] = o.scan(self.img, f)
-        return self.res[f]
+        def put(buf, base, va, v):
+            struct.pack_into(">I", buf, va - base, v)
+        put(data, cls.DATA_LO, cls.DATA_LO, 0x10100)             # OPD de e_entry
+        put(data, cls.DATA_LO, cls.DATA_LO + 4, cls.TOC_E)
+        for i in range(40):                                        # OPD de relleno
+            put(data, cls.DATA_LO, cls.DATA_LO + 0x40 + 8 * i, cls.CODE_LO + 4 * i)
+            put(data, cls.DATA_LO, cls.DATA_LO + 0x44 + 8 * i, cls.TOC_E)
+        put(data, cls.DATA_LO, cls.F_OPD, cls.F)
+        put(data, cls.DATA_LO, cls.F_OPD + 4, cls.TOC_E)
+        put(data, cls.DATA_LO, cls.VT, cls.DATA_LO + 0x40)         # vtable: OPD, OPD(F), OPD
+        put(data, cls.DATA_LO, cls.VT + 4, cls.F_OPD)
+        put(data, cls.DATA_LO, cls.VT + 8, cls.DATA_LO + 0x48)
+        put(code, cls.CODE_LO, 0x10300, (15 << 26) | (9 << 21) | 2)                   # lis r9,2
+        put(code, cls.CODE_LO, 0x10304, (14 << 26) | (9 << 21) | (9 << 16) | 0x0400)   # addi r9,r9,0x400 -> 0x20400 = OPD de F
+        return build_elf.build_elf64_be([(cls.CODE_LO, bytes(code), 5), (cls.DATA_LO, bytes(data), 6)], entry=cls.DATA_LO)
 
-    def test_formato(self):
-        r = self.scan(0x5cde14)
-        self.assertEqual(r["format"]["toc"], 0xD5CAA8)
-        self.assertEqual(r["format"]["pairs_with_toc"], 26351)      # PrepPS3: 26 351 descriptores
-        # segunda base de TOC: los hilos del juego corren con r2=0xD6CA90 (docs/puente_rpcs3.md, Fase 0, run 2)
-        self.assertEqual(r["format"]["other_tocs"], [["0xd6ca90", 12201]])
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.td.name, "p.elf")
+        with open(self.path, "wb") as f:
+            f.write(self.build())
 
-    def test_destructor_de_fuente_en_vtable_cfb7e8(self):          # docs/vwf_renderizadores.md sesión 3
-        r = self.scan(0x5cde14)
-        self.assertEqual([x["opd"] for x in r["opds"]], [0xD22930])
-        d = r["opds"][0]["data_refs"]
-        self.assertEqual([x["va"] for x in d], [0xCFB7E8])
-        self.assertTrue(d[0]["vtable_like"])
+    def tearDown(self):
+        self.td.cleanup()
 
-    def test_cargar_fuente_sin_referencias_estaticas(self):        # docs/vwf_renderizadores.md sesión 2
-        r = self.scan(0x5cd768)
-        self.assertEqual([x["opd"] for x in r["opds"]], [0xD228F8])
-        self.assertEqual(r["opds"][0]["data_refs"], [])
-        self.assertEqual(r["opds"][0]["code_built"], [])
+    def test_from_elf_lee_segmentos_codigo_y_toc_del_entry(self):
+        img = o.Image.from_elf(self.path)
+        self.assertEqual(img.code, [(self.CODE_LO, self.CODE_LO + 0x1000)])
+        self.assertEqual(img.entry_toc, self.TOC_E)
+        self.assertEqual(img.u32(self.F_OPD), self.F)
 
-    def test_005cd7f0_no_es_inicio_de_funcion(self):
-        r = self.scan(0x5cd7f0)
-        self.assertEqual(r["opds"], [])
-        self.assertEqual(self.img.u32(0x5cd7f0) >> 26, 18)          # opcode b/bl
-        self.assertEqual(self.img.u32(0x5cd7f0) & 1, 1)             # LK=1: es un bl
+    def test_scan_sobre_elf(self):
+        r = o.scan(o.Image.from_elf(self.path), self.F, None, min_count=10)
+        self.assertEqual(r["format"]["toc"], self.TOC_E)
+        self.assertEqual([x["opd"] for x in r["opds"]], [self.F_OPD])
+        refs = r["opds"][0]["data_refs"]
+        self.assertEqual([d["va"] for d in refs], [self.VT + 4])
+        self.assertTrue(refs[0]["vtable_like"])
+        self.assertEqual(r["opds"][0]["code_built"], [0x10300])
+
+    def test_cli_elf_y_json(self):
+        out = os.path.join(self.td.name, "o.json")
+        self.assertEqual(o.main(["opd_scan", "--elf", self.path, "--func", hex(self.F), "--min-count", "10", "--json", out]), 0)
+        self.assertGreater(os.path.getsize(out), 10)
+
+    def test_elf_invalido_falla_cerrado(self):
+        bad = os.path.join(self.td.name, "bad.elf")
+        with open(bad, "wb") as f:
+            f.write(b"no soy un elf" * 10)
+        with self.assertRaises(o.ScanError):
+            o.Image.from_elf(bad)
+        self.assertEqual(o.main(["opd_scan", "--elf", bad, "--func", "0x1000"]), 1)
+
+    def test_elf_sin_segmento_ejecutable_o_entry_invalido(self):
+        sin_x = os.path.join(self.td.name, "sinx.elf")
+        with open(sin_x, "wb") as f:
+            f.write(build_elf.build_elf64_be([(self.DATA_LO, bytes(0x100), 6)], entry=self.DATA_LO))
+        with self.assertRaises(o.ScanError):
+            o.Image.from_elf(sin_x)
+        entry_malo = os.path.join(self.td.name, "entry.elf")
+        with open(entry_malo, "wb") as f:
+            f.write(build_elf.build_elf64_be([(self.CODE_LO, bytes(0x100), 5)], entry=self.CODE_LO))   # e_entry apunta a código, no a un OPD
+        with self.assertRaises(o.ScanError):
+            o.Image.from_elf(entry_malo)
 
 
 if __name__ == "__main__":

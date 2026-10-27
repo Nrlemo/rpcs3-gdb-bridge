@@ -1,6 +1,6 @@
-// Función contenedora de cada dirección dada. Args: <salida.txt> VA [VA ...]   (hex, p. ej. 0x48974)
+// Función contenedora de cada dirección dada. Args: <salida.txt> VA [VA ...]   (hex, p. ej. 0x20010)
 // Salida: una línea por VA: "VA entrada nombre inicio-fin"; "VA -" si ninguna función la contiene.
-// @category SRW
+// @category RE
 import ghidra.app.script.GhidraScript;
 import ghidra.program.model.address.*;
 import ghidra.program.model.listing.*;
