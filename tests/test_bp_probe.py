@@ -182,6 +182,20 @@ class TestImpactos(unittest.TestCase):
         self.assertEqual(p.site_font[0x48974], 0)
         self.assertEqual(len(self.recs()), 3)                               # solo los 3 primeros no-fuente
 
+    def test_vigia_registra_impacto_silencioso(self):
+        g, p = self.probe([{"pc": 0x48974, "lr": 0x5CD7F4, "r28": 0x30068B10, "r5": 0, "r1": 0x1000}])
+        self.assertTrue(p.handle_hit(20.0, via="vigia"))
+        r = self.recs()[0]
+        self.assertEqual((r["via"], r["site"], r["val"]), ("vigia", "0x48974", 0))
+
+    def test_vigia_sin_sitio_registra_tabla_de_hilos(self):
+        g, p = self.probe([{"pc": 0x1234, "lr": 0, "r1": 0x1000}])
+        p.threads = ["0000000001000001"]
+        self.assertFalse(p.handle_hit(20.0, via="vigia"))
+        e = self.recs()[0]
+        self.assertEqual(e["evento"], "vigia_sin_sitio")
+        self.assertIn("0001", e["hilos"])
+
     def test_tope_por_clave_y_retiro_del_sitio(self):
         g, p = self.probe([{"pc": 0x48974, "lr": 0x5CD7F4, "r28": 0x30068B10, "r5": 1, "r1": 0x1000}], cap_key=2, cap_site=5)
         for _ in range(5):

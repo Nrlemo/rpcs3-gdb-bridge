@@ -14,7 +14,7 @@ Al final, resumen con impactos/s y latencia por ciclo (para decidir entre `Z0` y
 Uso (con el proxy en marcha y el juego corriendo; ver docs/puente_rpcs3.md):
   python3 -I tools/rpcs3_bridge/bp_probe.py --elf work/eboot/EBOOT.elf --sites sitios.txt --out salida.jsonl
       --log <RPCS3.log> [--thread <id_hex>] [--route tests/rutas/R2.json --route-log <salida>/route.log]
-      [--label-file etiqueta.txt] [--keep-after-route] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
+      [--label-file etiqueta.txt] [--keep-after-route] [--watchdog 20] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
 `sitios.txt`: una línea por sitio, `0xVA [nombre]`; `#` comenta. La salida no debe existir. Si un sitio no es `stb`/`lbz` con
 desplazamiento 0xd4, aborta. No cierra la conexión del proxy; al terminar quita sus `Z0` y deja el juego corriendo.
 """
@@ -175,16 +175,26 @@ class Probe:
                 return t, r
         return None, None
 
-    def handle_hit(self, t_wait):
+    def handle_hit(self, t_wait, via=None):
         t1 = time.time()
         tid_hit = self.tid
         r = parse_g(self.g.cmd("g"))
         if r.get("pc") not in self.sites:
+            r_juego = r
             tid_hit, r = self.find_hit_thread()
             self.select(self.tid)
             if tid_hit is None:
-                self.emit({"t": round(time.time() - self.t0, 3), "evento": "parada_sin_sitio", "pc": hex(r.get("pc", 0)),
-                           "lr": hex(r.get("lr", 0)), "hilo_juego": self.tid})
+                r = r_juego
+                rec = {"t": round(time.time() - self.t0, 3), "evento": "parada_sin_sitio" if via is None else "vigia_sin_sitio",
+                       "pc": hex(r.get("pc", 0)), "lr": hex(r.get("lr", 0)), "hilo_juego": self.tid}
+                if via is not None:      # tabla de PC de todos los hilos, para ver dónde está parado cada uno
+                    rec["hilos"] = {}
+                    for t in self.threads:
+                        self.select(t)
+                        rr = parse_g(self.g.cmd("g"))
+                        rec["hilos"][t[-4:]] = [hex(rr.get("pc", 0)), hex(rr.get("lr", 0))]
+                    self.select(self.tid)
+                self.emit(rec)
                 return False
             self.select(tid_hit)
         pc = r["pc"]
@@ -214,6 +224,8 @@ class Probe:
                    "is_font": is_font, "vtable": hex(vtable) if vtable is not None else None, "val": val,
                    "r3_r10": [hex(r["r%d" % i]) for i in range(3, 11)], "r1": hex(r["r1"]),
                    "chain": walk_chain(self.g.read, self.img, r["r1"]), "veces_clave": self.keys[key]}
+            if via:
+                rec["via"] = via
         # reanudar: quitar el Z0, un paso (en el hilo que paró), reponerlo
         if tid_hit != self.tid:
             self.g.cmd("Hc" + tid_hit)
@@ -264,6 +276,7 @@ def main(argv):
     ap.add_argument("--keep-after-route", action="store_true", help="no parar cuando la ruta termina (seguir hasta --duration o una señal)")
     ap.add_argument("--label-file", help="etiqueta manual (primera línea del archivo), alternativa a --route")
     ap.add_argument("--duration", type=float, default=600.0)
+    ap.add_argument("--watchdog", type=float, default=0.0, help="si no hay parada en N s, interrumpir y mirar el PC (detecta un hilo parado en un Z0 sin parada comunicada)")
     ap.add_argument("--max-bps", type=int, default=8)
     ap.add_argument("--cap-key", type=int, default=10)
     ap.add_argument("--cap-site", type=int, default=500)
@@ -309,11 +322,16 @@ def main(argv):
                 t_c = time.time()
                 g.cont()
                 stop = None
+                via = None
                 while time.time() < deadline and not stop_req and not route_over():
                     try:
                         stop = g.wait_stop(timeout=2.0)
                         break
                     except (TimeoutError, OSError):
+                        if a.watchdog and time.time() - t_c > a.watchdog:
+                            stop = g.interrupt(timeout=20.0)
+                            via = "vigia"
+                            break
                         continue
                 if stop is None:
                     if stop_req:
@@ -322,7 +340,7 @@ def main(argv):
                         reason = "ruta_terminada"
                     g.interrupt(timeout=20.0)
                     break
-                p.handle_hit(time.time() - t_c)
+                p.handle_hit(time.time() - t_c, via)
         except KeyboardInterrupt:
             reason = "interrumpido"
         finally:
