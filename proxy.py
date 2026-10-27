@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Proxy RSP persistente para el servidor GDB de RPCS3 (#20).
 
-Problema (leído en `rpcs3/Emu/GDB.cpp`, ver `docs/verificacion_watchpoints_rpcs3.md` §1.2): el servidor
+Problema (leído en `rpcs3/Emu/GDB.cpp`, ver docs/servidor_gdb_rpcs3.md): el servidor
 solo atiende una conexión por arranque, no implementa `D` y, si el cliente cierra el socket, el hilo
 muere y el emulador queda congelado. Este proxy abre UNA conexión al servidor y no la cierra nunca;
 los clientes se conectan al proxy, de a uno por vez, y pueden irse y volver.
@@ -25,9 +25,9 @@ Registro: JSONL, una línea por evento (`t`, `ev`, `dir`, `body` truncado a 200 
 un registro existente.
 
 Uso:
-  python3 -I tools/rpcs3_bridge/proxy.py [--upstream 127.0.0.1:2345] [--listen 127.0.0.1:2346]
-        [--log work/tmp/bridge/<fecha>.jsonl] [--allow-kill] [--no-translate]
-Luego los clientes (p. ej. `tools/gdbrsp.py` con el puerto del proxy) se conectan a --listen.
+  python3 -I proxy.py [--upstream 127.0.0.1:2345] [--listen 127.0.0.1:2346]
+        [--log ./rpcs3_bridge_logs/<fecha>.jsonl] [--allow-kill] [--no-translate]
+Luego los clientes (p. ej. `gdbrsp.py` con el puerto del proxy) se conectan a --listen.
 """
 import argparse
 import json
@@ -301,14 +301,18 @@ def _addr(s):
     return h, int(p)
 
 
-def main(argv) -> int:
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--upstream", default="127.0.0.1:2345")
     ap.add_argument("--listen", default="127.0.0.1:2346")
     ap.add_argument("--log", default=os.path.join(os.getcwd(), "rpcs3_bridge_logs", time.strftime("%Y%m%d_%H%M%S") + ".jsonl"))
     ap.add_argument("--allow-kill", action="store_true")
     ap.add_argument("--no-translate", action="store_true")
-    a = ap.parse_args(argv[1:])
+    return ap
+
+
+def main(argv) -> int:
+    a = build_parser().parse_args(argv[1:])
     b = Bridge(_addr(a.upstream), _addr(a.listen), a.log, a.allow_kill, not a.no_translate)
     b.open()
     print("proxy: %s -> %s:%d | log %s" % (a.upstream, b.listen_addr[0], b.listen_port, a.log), flush=True)

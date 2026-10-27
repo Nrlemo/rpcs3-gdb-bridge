@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Control de la Fase 0 (#20): con el decoder LLVM, ¿el servidor acepta `Z0` pero nunca para? (docs/puente_rpcs3.md)
+"""Control: con el decoder LLVM, ¿el servidor acepta `Z0` pero nunca para? (docs/servidor_gdb_rpcs3.md)
 
-Se conecta al PROXY con el juego corriendo con `PPU Decoder: Recompiler (LLVM)`. Toma muestras de LR con interrupciones
-(LR en el EBOOT = direcciones de retorno que el juego recorre), pone `Z0` en cada una y espera 20 s por un impacto; prueba
-también un `s`. Los mismos pasos con el intérprete dieron impactos (fase0.py).
-Uso: python3 -I tools/rpcs3_bridge/fase0_llvm.py <salida.json> <id_hilo_hex> [puerto_proxy=2346]
+Se conecta al PROXY con el programa corriendo con `PPU Decoder: Recompiler (LLVM)`. Toma muestras de LR con interrupciones
+(LR dentro del rango de código = direcciones de retorno que el programa recorre), pone `Z0` en cada una y espera 20 s por un impacto;
+prueba también un `s`. Los mismos pasos con el intérprete dan impactos (validate_server.py).
+Uso: python3 -I check_decoder_z0.py <salida.json> <id_hilo_hex> (--elf programa.elf | --code lo-hi) [--port 2346]
 """
 import json
 import os
@@ -15,14 +15,28 @@ from collections import Counter
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from gdbrsp import Gdb  # noqa: E402
+import validate_server  # noqa: E402
 from validate_server import parse_g, in_code  # noqa: E402
 
 R = {}
 
 
+def build_parser():
+    import argparse
+    ap = argparse.ArgumentParser(description="Control del decoder LLVM: Z0 aceptado pero sin paradas")
+    ap.add_argument("out", help="JSON de salida (no debe existir)")
+    ap.add_argument("thread", help="id del hilo a depurar (hex)")
+    ap.add_argument("--port", type=int, default=2346, help="puerto del proxy (def. %(default)s)")
+    validate_server.add_code_args(ap)
+    return ap
+
+
 def main(argv):
-    out, tid = argv[1], argv[2].zfill(16)
-    port = int(argv[3]) if len(argv) > 3 else 2346
+    a = build_parser().parse_args(argv[1:])
+    out, tid, port = a.out, a.thread.zfill(16), a.port
+    if not validate_server.set_code_ranges(a.elf, a.code):
+        print("error: hace falta --elf o --code (rango de código)", file=sys.stderr)
+        return 2
     if os.path.exists(out):
         print("error: %s ya existe" % out, file=sys.stderr)
         return 1

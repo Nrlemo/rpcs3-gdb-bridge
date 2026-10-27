@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""Fase 0 del puente (#20): ¿el servidor GDB real de RPCS3 (intérprete PPU) para en un Z0 y reanuda? (docs/puente_rpcs3.md)
+"""Validación del servidor GDB real de RPCS3 (intérprete PPU): ¿para en un Z0, reanuda y soporta el patrón de un sondeo? (docs/proxy.md)
 
-Se conecta AL PROXY (no al 2345) con el juego ya corriendo; conectar el proxy pausa el emulador. Pruebas, en orden:
-  T0 hilos (`qfThreadInfo`) y registros por `g` de cada uno; se elige el hilo del juego (el primero con LR en el EBOOT, o el
-     id dado como 3.er argumento). Sin `Hg<id>` el servidor usa el PRIMER hilo PPU, que no es el del juego.
+Se conecta AL PROXY (no al puerto del servidor) con un programa ya corriendo; conectar el proxy pausa el emulador. Pruebas, en orden:
+  T0 hilos (`qfThreadInfo`) y registros por `g` de cada uno; se elige el hilo con `--thread`, o el primero con LR en el rango de
+     código (`--elf`/`--code`). Sin `Hg<id>` el servidor usa el PRIMER hilo PPU, que no suele ser el del programa.
   T1 5 pasos con `s`                     (¿S05 y avanza el PC?)
   T2 Z0 a pocas instrucciones sin saltos  (¿para exactamente ahí?)
-  T3 marcha libre + interrupción         (¿el juego corre? PCs distintos entre muestras)
-  T4 bucle de Z0 recurrente x5           (rm -> paso -> Z0 -> continuar; el patrón de la Fase 2)
+  T3 marcha libre + interrupción         (¿corre? PCs distintos entre muestras)
+  T4 bucle de Z0 recurrente x5           (rm -> paso -> Z0 -> continuar; el patrón de bp_probe) — necesita --elf/--code
   T6 continuar SIN quitar el Z0         (¿vuelve a parar en la misma instrucción?)
   T5 `D`, desconexión del cliente, reconexión y lectura (¿el proxy mantiene viva la sesión real?)
-Uso: python3 -I tools/rpcs3_bridge/fase0.py <salida.json> [puerto_proxy=2346] [id_hilo_hex]
+Uso: python3 -I validate_server.py <salida.json> [--port 2346] [--thread <id_hex>] [--elf programa.elf | --code lo-hi] [--toc 0x...]
+`--elf`: rango de código = segmentos PT_LOAD ejecutables (vía opd_scan); `--code`: lo-hi en hex; `--toc`: r2 esperado (opcional).
 No cierra nunca la conexión del proxy al servidor. La salida no debe existir.
 """
 import json
@@ -23,8 +24,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from gdbrsp import Gdb  # noqa: E402
 
-CODE = (0x10000, 0xCEBA68)
-TOC = 0xD5CAA8
+CODE_RANGES = []        # [(lo, hi)] rangos ejecutables; se fijan con set_code_ranges()
+TOC = None              # r2 esperado (opcional)
+OUT_PATH = None
 OFFS = {"pc": 1024, "msr": 1040, "cr": 1056, "lr": 1064, "ctr": 1080, "xer": 1096, "fpscr": 1104}
 R = {}
 
@@ -49,7 +51,24 @@ def regs(g):
 
 
 def in_code(a):
-    return CODE[0] <= a < CODE[1]
+    return any(lo <= a < hi for lo, hi in CODE_RANGES)
+
+
+def set_code_ranges(elf=None, code=None):
+    """Fija los rangos de código desde un ELF (segmentos PF_X) y/o desde 'lo-hi' (hex). Sin ninguno: lista vacía."""
+    CODE_RANGES.clear()
+    if elf:
+        import opd_scan
+        CODE_RANGES.extend(opd_scan.Image.from_elf(elf).code)
+    if code:
+        lo, hi = (int(x, 16) for x in code.split("-"))
+        CODE_RANGES.append((lo, hi))
+    return CODE_RANGES
+
+
+def add_code_args(ap):
+    ap.add_argument("--elf", help="ELF del programa: rango de código = segmentos ejecutables")
+    ap.add_argument("--code", help="rango de código lo-hi en hex (alternativa a --elf)")
 
 
 def is_branch(ins):
@@ -57,9 +76,25 @@ def is_branch(ins):
     return op in (16, 17, 18, 19)       # bc, sc, b, bclr/bcctr
 
 
+def build_parser():
+    import argparse
+    ap = argparse.ArgumentParser(description="Valida el servidor GDB de RPCS3 a través del proxy")
+    ap.add_argument("out", help="JSON de salida (no debe existir)")
+    ap.add_argument("--port", type=int, default=2346, help="puerto del proxy (def. %(default)s)")
+    ap.add_argument("--thread", help="id del hilo a depurar (hex); sin él hace falta --elf/--code")
+    ap.add_argument("--toc", type=lambda x: int(x, 0), default=None, help="r2 esperado (opcional)")
+    add_code_args(ap)
+    return ap
+
+
 def main(argv):
-    out = argv[1]
-    port = int(argv[2]) if len(argv) > 2 else 2346
+    global TOC, OUT_PATH
+    a = build_parser().parse_args(argv[1:])
+    out, port, TOC, OUT_PATH = a.out, a.port, a.toc, a.out
+    set_code_ranges(a.elf, a.code)
+    if not a.thread and not CODE_RANGES:
+        print("error: sin --thread hace falta --elf o --code para elegir el hilo", file=sys.stderr)
+        return 2
     if os.path.exists(out):
         print("error: %s ya existe" % out, file=sys.stderr)
         return 1
@@ -74,7 +109,7 @@ def main(argv):
         rr = regs(g)
         threads[tid] = {"pc": hex(rr.get("pc", 0)), "lr": hex(rr.get("lr", 0)), "r2": hex(rr.get("r2", 0))}
     R["T0"]["hilos"] = threads
-    want = argv[3].zfill(16) if len(argv) > 3 else None
+    want = a.thread.zfill(16) if a.thread else None
     tid = want or next((t for t in ids if in_code(int(threads[t]["lr"], 16))), ids[0] if ids else None)
     R["T0"]["hilo_elegido"] = tid
     if tid:
@@ -83,7 +118,7 @@ def main(argv):
     r0 = regs(g)
     R["T0"].update({k: (hex(v) if isinstance(v, int) and k != "len" else v) for k, v in r0.items() if k in ("len", "pc", "lr", "ctr", "cr", "r1", "r2", "r3")})
     R["T0"]["pc_en_codigo"] = in_code(r0.get("pc", 0))
-    R["T0"]["r2_es_TOC"] = r0.get("r2") == TOC
+    R["T0"]["r2_es_TOC"] = (r0.get("r2") == TOC) if TOC is not None else None
     say("T0", R["T0"])
 
     # T1: pasos
@@ -133,6 +168,8 @@ def main(argv):
     from collections import Counter
     cands = [int(a, 16) for a, _ in Counter(x["lr"] for x in samples).most_common() if in_code(int(a, 16))]
     t4 = {"candidatos": [hex(c) for c in cands], "intentos": []}
+    if not CODE_RANGES:
+        t4["nota"] = "sin rango de código (--elf/--code): no se eligen candidatos"
     for a in cands[:4]:
         att = {"addr": hex(a), "hits": []}
         ok = g.bp(a)
@@ -210,7 +247,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main(sys.argv))
     except BaseException:
-        if len(sys.argv) > 1 and not os.path.exists(sys.argv[1]) and R:
-            with open(sys.argv[1] + ".parcial", "w") as f:
+        if OUT_PATH and not os.path.exists(OUT_PATH) and R:
+            with open(OUT_PATH + ".parcial", "w") as f:
                 json.dump(R, f, indent=1)
         raise
