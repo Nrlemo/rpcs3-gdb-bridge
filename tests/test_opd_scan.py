@@ -84,7 +84,7 @@ class TestSynthetic(unittest.TestCase):
         put(0x10000, lis(9, 2)); put(0x10004, addi(9, 9, -0x7FF8))          # 0x20000 - 0x7ff8 = 0x18008
         put(0x10010, (15 << 26) | (9 << 21) | (2 << 16) | 0xFFFF); put(0x10014, addi(9, 9, 0x10))  # TOC - 0x10000 + 0x10
         img = o.Image([(BASE, bytes(code))], [(BASE, BASE + 0x1000)])
-        h = o.ppc_scan(img, {0x18008, TOC - 0x10000 + 0x10}, TOC)
+        h = o.ppc_scan(img, {0x18008, TOC - 0x10000 + 0x10}, [TOC])
         self.assertEqual(h[0x18008], [0x10000])
         self.assertEqual(h[TOC - 0x10000 + 0x10], [0x10010])
 
@@ -120,6 +120,8 @@ class TestEbootReal(unittest.TestCase):
         r = self.scan(0x5cde14)
         self.assertEqual(r["format"]["toc"], 0xD5CAA8)
         self.assertEqual(r["format"]["pairs_with_toc"], 26351)      # PrepPS3: 26 351 descriptores
+        # segunda base de TOC: los hilos del juego corren con r2=0xD6CA90 (docs/puente_rpcs3.md, Fase 0, run 2)
+        self.assertEqual(r["format"]["other_tocs"], [["0xd6ca90", 12201]])
 
     def test_destructor_de_fuente_en_vtable_cfb7e8(self):          # docs/vwf_renderizadores.md sesión 3
         r = self.scan(0x5cde14)

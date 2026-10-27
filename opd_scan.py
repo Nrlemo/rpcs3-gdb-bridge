@@ -4,7 +4,7 @@
 Una llamada indirecta usa un descriptor de función (OPD): dos u32 consecutivos (código, TOC). Para una función F:
   1. verifica el formato OPD: el TOC sale del OPD de `e_entry` (ELF) o de --toc (obligatorio con --raw) y debe ser el
      segundo campo más frecuente entre los pares (u32 en código, u32 en datos) con >= --min-count (1000) apariciones;
-     si no, ABORTA. (Hay otras tablas de pares con otro segundo campo, p. ej. 12 201 con 0xD6CA90 en el EBOOT);
+     si no, ABORTA. Los TOC adicionales con >= --min-count pares a < 1 MiB del principal también se aceptan (el EBOOT usa 0xD5CAA8 y 0xD6CA90);
   2. busca los OPD (F, TOC);
   3. por cada OPD busca (a) u32 == dirección del OPD en datos (vtables, tablas, slots de TOC) y
      (b) direcciones construidas en código: `lis rD,hi` + `addi|ori rD,rD,lo` (con rD como destino o como origen),
@@ -100,7 +100,7 @@ class Image:
 
 
 def detect_toc(img, toc_hint, min_count):
-    """Valida el formato OPD (código, TOC) y devuelve (toc, estadística, palabras). Falla cerrado.
+    """Valida el formato OPD (código, TOC) y devuelve ([toc principal, otros TOC], estadística, palabras). Falla cerrado.
 
     El TOC no se adivina por proporción (hay otras tablas de pares con otro segundo campo): sale del OPD de
     `e_entry` (ELF) o de --toc (volcado crudo), y debe ser además el segundo campo más frecuente entre los
@@ -128,10 +128,15 @@ def detect_toc(img, toc_hint, min_count):
         raise ScanError("solo %d pares (código, 0x%x) < %d: el formato OPD no se confirma (%s)" % (n, toc, min_count, stat))
     if not top or top[0][0] != toc:
         raise ScanError("0x%x no es el segundo campo más frecuente: %s" % (toc, stat))
-    return toc, stat, w
+    # Otras bases de TOC: la TOC de PPC64 cubre ±32 KiB, así que un binario grande usa varias (el EBOOT: 0xD5CAA8 y
+    # 0xD6CA90; los hilos del juego corren con r2=0xD6CA90, docs/puente_rpcs3.md Fase 0). Se aceptan las que tienen
+    # >= min_count pares, no el cero, y cuya base queda a < 1 MiB de la principal.
+    others = sorted(k for k, c in cnt.items() if k != toc and k and c >= min_count and abs(k - toc) < (1 << 20))
+    stat["other_tocs"] = [[hex(k), cnt[k]] for k in others]
+    return [toc] + others, stat, w
 
 
-def ppc_scan(img, targets, toc):
+def ppc_scan(img, targets, tocs):
     """Direcciones construidas en código. Devuelve {valor: [va_de_la_primera_instrucción, ...]}."""
     hits = {t: [] for t in targets}
     for lo, hi in img.code:
@@ -151,9 +156,9 @@ def ppc_scan(img, targets, toc):
                 continue
             rd, ra, imm = (ins >> 21) & 31, (ins >> 16) & 31, ins & 0xFFFF
             if ra == 0:
-                base = 0
+                bases = (0,)
             elif ra == 2:
-                base = toc
+                bases = tocs
             else:
                 continue
             hi16 = (imm - 0x10000 if imm & 0x8000 else imm) << 16
@@ -170,24 +175,25 @@ def ppc_scan(img, targets, toc):
                     lo16 = nimm
                 if nra != rd:
                     continue
-                val = ((base + hi16 + lo16) if nop == 14 else ((base + hi16) | lo16)) & 0xFFFFFFFF
-                if val in hits:
-                    hits[val].append(lo + 4 * i)
+                for base in bases:
+                    val = ((base + hi16 + lo16) if nop == 14 else ((base + hi16) | lo16)) & 0xFFFFFFFF
+                    if val in hits and (lo + 4 * i) not in hits[val]:
+                        hits[val].append(lo + 4 * i)
                 if nrd == rd:
                     break                    # el registro se sobreescribe
     return hits
 
 
 def scan(img, func, toc_hint=None, min_count=1000):
-    toc, stat, w = detect_toc(img, toc_hint, min_count)
+    tocs, stat, w = detect_toc(img, toc_hint, min_count)
     out = {"func": func, "format": stat, "opds": [], "direct_code_pointers": []}
-    opd_addrs = [va for va, v in w.items() if v == func and w.get(va + 4) == toc]
+    opd_addrs = [va for va, v in w.items() if v == func and w.get(va + 4) in tocs]
     out["direct_code_pointers"] = sorted(va for va, v in w.items() if v == func and va not in opd_addrs)
-    is_opd = lambda va: va in w and img.in_code(w[va]) and w.get(va + 4) == toc
-    ctor = ppc_scan(img, set(opd_addrs) | {func}, toc)
+    is_opd = lambda va: va in w and img.in_code(w[va]) and w.get(va + 4) in tocs
+    ctor = ppc_scan(img, set(opd_addrs) | {func}, tocs)
     for o in sorted(opd_addrs):
         refs = sorted(va for va, v in w.items() if v == o)
-        rec = {"opd": o, "align8": o % 8 == 0, "data_refs": [], "code_built": sorted(ctor[o])}
+        rec = {"opd": o, "toc": w.get(o + 4), "align8": o % 8 == 0, "data_refs": [], "code_built": sorted(ctor[o])}
         for r in refs:
             nb = []
             for k in range(-2, 3):
@@ -201,11 +207,11 @@ def scan(img, func, toc_hint=None, min_count=1000):
 
 def report(res):
     f = res["format"]
-    L = ["formato OPD: TOC 0x%08x (%s), %d pares; segundos campos más frecuentes: %s" % (f["toc"], f["toc_source"], f["pairs_with_toc"], f["top_second_fields"]),
+    L = ["formato OPD: TOC 0x%08x (%s), %d pares; otros TOC aceptados: %s; segundos campos más frecuentes: %s" % (f["toc"], f["toc_source"], f["pairs_with_toc"], f["other_tocs"], f["top_second_fields"]),
          "función 0x%08x: %d OPD, %d u32 a código sin OPD" % (res["func"], len(res["opds"]), len(res["direct_code_pointers"]))]
     for o in res["opds"]:
-        L.append("  OPD 0x%08x (alineado a 8: %s): %d referencias en datos, %d direcciones construidas en código" %
-                 (o["opd"], o["align8"], len(o["data_refs"]), len(o["code_built"])))
+        L.append("  OPD 0x%08x (TOC 0x%08x, alineado a 8: %s): %d referencias en datos, %d direcciones construidas en código" %
+                 (o["opd"], o["toc"], o["align8"], len(o["data_refs"]), len(o["code_built"])))
         for r in o["data_refs"]:
             L.append("    dato 0x%08x%s: %s" % (r["va"], " [tipo vtable]" if r["vtable_like"] else "",
                                                " ".join(("*" if n["va"] == r["va"] else "") + ("OPD:" if n["is_opd"] else "") + ("%08x" % n["u32"] if n["u32"] is not None else "--") for n in r["neighbors"])))
