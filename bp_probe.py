@@ -14,7 +14,7 @@ Al final, resumen con impactos/s y latencia por ciclo (para decidir entre `Z0` y
 Uso (con el proxy en marcha y el juego corriendo; ver docs/puente_rpcs3.md):
   python3 -I tools/rpcs3_bridge/bp_probe.py --elf work/eboot/EBOOT.elf --sites sitios.txt --out salida.jsonl
       --log <RPCS3.log> [--thread <id_hex>] [--route tests/rutas/R2.json --route-log <salida>/route.log]
-      [--label-file etiqueta.txt] [--keep-after-route] [--watchdog 20] [--dump ra:0:0x80]... [--all-regs] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
+      [--label-file etiqueta.txt] [--keep-after-route] [--watchdog 5] [--dump ra:0:0x80]... [--all-regs] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
 `sitios.txt`: una línea por sitio, `0xVA [nombre]`; `#` comenta. La salida no debe existir. Si un sitio no es `stb`/`lbz` con
 desplazamiento 0xd4, aborta. No cierra la conexión del proxy; al terminar quita sus `Z0` y deja el juego corriendo.
 """
@@ -37,6 +37,7 @@ import opd_scan  # noqa: E402
 
 FONT_VTABLE = 0xCFB7E8
 BL_LIKE = (0x4E800421, 0x4E800021)      # bctrl, blrl
+DEFAULT_WATCHDOG = 5.0                  # s; las paradas silenciosas son habituales con Z0 (docs/puente_rpcs3.md, Fase 2)
 
 
 def decode_site(img, va):
@@ -288,7 +289,35 @@ class Probe:
                             "valores_en_objetos_de_fuente": {k: dict(v) for k, v in valores.items()}}}
 
 
-def main(argv):
+def wait_stop_or_watchdog(g, t_c, watchdog, deadline, stopping):
+    """Espera la parada del servidor. Si pasan `watchdog` s sin ella (0 lo desactiva) interrumpe (el «vigía»): un hilo puede quedar
+    parado en un Z0 sin que el servidor lo comunique. Devuelve (parada, via); (None, None) si venció el plazo o se pidió parar."""
+    while time.time() < deadline and not stopping():
+        try:
+            return g.wait_stop(timeout=2.0), None
+        except (TimeoutError, OSError):
+            if watchdog and time.time() - t_c > watchdog:
+                return g.interrupt(timeout=20.0), "vigia"
+    return None, None
+
+
+def run_loop(g, p, deadline, watchdog, stop_req, route_over):
+    """Bucle principal: continuar, esperar la parada (con vigía), procesar el impacto. Devuelve el motivo de fin."""
+    while time.time() < deadline and not stop_req:
+        if route_over():
+            return "ruta_terminada"
+        t_c = time.time()
+        g.cont()
+        stop, via = wait_stop_or_watchdog(g, t_c, watchdog, deadline, lambda: bool(stop_req) or route_over())
+        if stop is None:
+            reason = "senal" if stop_req else ("ruta_terminada" if route_over() else "duracion")
+            g.interrupt(timeout=20.0)
+            return reason
+        p.handle_hit(time.time() - t_c, via)
+    return "duracion"
+
+
+def build_parser():
     ap = argparse.ArgumentParser(description="Sondeo con Z0 de las escrituras/lecturas de obj+0xd4")
     ap.add_argument("--elf", required=True)
     ap.add_argument("--sites", required=True)
@@ -300,14 +329,18 @@ def main(argv):
     ap.add_argument("--keep-after-route", action="store_true", help="no parar cuando la ruta termina (seguir hasta --duration o una señal)")
     ap.add_argument("--label-file", help="etiqueta manual (primera línea del archivo), alternativa a --route")
     ap.add_argument("--duration", type=float, default=600.0)
-    ap.add_argument("--watchdog", type=float, default=0.0, help="si no hay parada en N s, interrumpir y mirar el PC (detecta un hilo parado en un Z0 sin parada comunicada)")
+    ap.add_argument("--watchdog", type=float, default=DEFAULT_WATCHDOG, help="vigía: si no hay parada en N s, interrumpir y mirar el PC (detecta un hilo parado en un Z0 sin parada comunicada). Por defecto %gs; 0 lo desactiva" % DEFAULT_WATCHDOG)
     ap.add_argument("--dump", action="append", default=[], help="REG:OFF:LEN (REG = ra del sitio o rN); vuelca memoria en cada registro de impacto")
     ap.add_argument("--all-regs", action="store_true", help="incluir r0..r31 en cada registro")
     ap.add_argument("--max-bps", type=int, default=8)
     ap.add_argument("--cap-key", type=int, default=10)
     ap.add_argument("--cap-site", type=int, default=500)
     ap.add_argument("--port", type=int, default=2346)
-    a = ap.parse_args(argv[1:])
+    return ap
+
+
+def main(argv):
+    a = build_parser().parse_args(argv[1:])
     if os.path.exists(a.out):
         print("error: %s ya existe" % a.out, file=sys.stderr)
         return 1
@@ -341,32 +374,7 @@ def main(argv):
         for sg in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sg, lambda *_: stop_req.append(1))
         try:
-            while time.time() < deadline and not stop_req:
-                if route_over():
-                    reason = "ruta_terminada"
-                    break
-                t_c = time.time()
-                g.cont()
-                stop = None
-                via = None
-                while time.time() < deadline and not stop_req and not route_over():
-                    try:
-                        stop = g.wait_stop(timeout=2.0)
-                        break
-                    except (TimeoutError, OSError):
-                        if a.watchdog and time.time() - t_c > a.watchdog:
-                            stop = g.interrupt(timeout=20.0)
-                            via = "vigia"
-                            break
-                        continue
-                if stop is None:
-                    if stop_req:
-                        reason = "senal"
-                    elif route_over():
-                        reason = "ruta_terminada"
-                    g.interrupt(timeout=20.0)
-                    break
-                p.handle_hit(time.time() - t_c, via)
+            reason = run_loop(g, p, deadline, a.watchdog, stop_req, route_over)
         except KeyboardInterrupt:
             reason = "interrumpido"
         finally:

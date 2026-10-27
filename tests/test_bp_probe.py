@@ -8,6 +8,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -234,6 +235,84 @@ class TestImpactos(unittest.TestCase):
         self.assertEqual(s["por_sitio"]["0x48974"]["impactos"], 5)
         self.assertTrue(s["por_sitio"]["0x48974"]["retirado"])
         self.assertEqual(s["valores_en_objetos_de_fuente"], {"0x48974": {"1": 5}})
+
+
+class FakeLoopGdb(FakeGdb):
+    """Servidor que NUNCA comunica la parada (la parada silenciosa de la Fase 2): wait_stop siempre vence por tiempo."""
+
+    def __init__(self, mem, regs_seq):
+        super().__init__(mem, regs_seq)
+        self.n_cont = self.n_interrupt = 0
+
+    def cont(self):
+        self.n_cont += 1
+        self.running = True
+
+    def wait_stop(self, timeout=0):
+        time.sleep(0.01)
+        raise TimeoutError
+
+    def interrupt(self, timeout=0):
+        self.n_interrupt += 1
+        self.running = False
+        return "S05"
+
+
+class TestVigia(unittest.TestCase):
+    def test_vigia_activado_por_defecto(self):
+        a = bp.build_parser().parse_args(["--elf", "e", "--sites", "s", "--out", "o"])
+        self.assertEqual(a.watchdog, bp.DEFAULT_WATCHDOG)
+        self.assertGreater(a.watchdog, 0)
+
+    def test_cero_lo_desactiva(self):
+        a = bp.build_parser().parse_args(["--elf", "e", "--sites", "s", "--out", "o", "--watchdog", "0"])
+        self.assertEqual(a.watchdog, 0)
+
+    def test_espera_devuelve_la_parada_normal_sin_vigia(self):
+        class G:
+            def wait_stop(self, timeout=0):
+                return "S05"
+
+            def interrupt(self, timeout=0):
+                raise AssertionError("no debía interrumpir")
+        self.assertEqual(bp.wait_stop_or_watchdog(G(), time.time(), 5.0, time.time() + 5, lambda: False), ("S05", None))
+
+    def _probe(self, g):
+        code = struct.pack(">II", 0x98000000 | (5 << 21) | (28 << 16) | 0xD4, 0)       # stb r5,0xd4(r28)
+        img = opd_scan.Image([(0x48974, code)], [(0x48974, 0x4897C)])
+        sites = {0x48974: {"va": 0x48974, "name": "w", **bp.decode_site(img, 0x48974)}}
+        out = io.StringIO()
+        return bp.Probe(g, img, sites, "0000000001000006", out), out
+
+    def _mem(self):
+        mem = {}
+        put(mem, 0x30068B10, struct.pack(">I", bp.FONT_VTABLE))
+        return mem
+
+    def test_el_bucle_recupera_un_impacto_silencioso_con_vigia(self):
+        g = FakeLoopGdb(self._mem(), [{"pc": 0x48974, "lr": 0x5CD7F4, "r28": 0x30068B10, "r5": 0, "r1": 0x1000}])
+        p, out = self._probe(g)
+        reason = bp.run_loop(g, p, time.time() + 0.6, 0.05, [], lambda: False)
+        recs = [json.loads(x) for x in out.getvalue().splitlines()]
+        self.assertEqual(reason, "duracion")
+        self.assertTrue(recs and all(r.get("via") == "vigia" for r in recs if "site" in r))
+        self.assertGreater(p.site_hits[0x48974], 1)               # varios ciclos: vigía -> impacto -> reanudar
+        self.assertGreater(g.n_interrupt, 1)
+
+    def test_sin_vigia_el_impacto_silencioso_no_se_ve(self):
+        g = FakeLoopGdb(self._mem(), [{"pc": 0x48974, "lr": 0, "r28": 0x30068B10, "r5": 0, "r1": 0x1000}])
+        p, out = self._probe(g)
+        reason = bp.run_loop(g, p, time.time() + 0.3, 0, [], lambda: False)
+        self.assertEqual(reason, "duracion")
+        self.assertEqual(p.n, 0)                                  # sin vigía nunca se entera del impacto
+        self.assertEqual(g.n_interrupt, 1)                        # solo la interrupción final
+
+    def test_senal_y_fin_de_ruta_terminan_el_bucle(self):
+        g = FakeLoopGdb({}, [{"pc": 0}])
+        p, _ = self._probe(g)
+        self.assertEqual(bp.run_loop(g, p, time.time() + 5, 5.0, [1], lambda: False), "duracion")   # señal antes de empezar: no hay ciclo
+        self.assertEqual(bp.run_loop(g, p, time.time() + 5, 5.0, [], lambda: True), "ruta_terminada")
+        self.assertEqual(g.n_cont, 0)
 
 
 if __name__ == "__main__":
