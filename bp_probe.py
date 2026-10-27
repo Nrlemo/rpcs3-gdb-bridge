@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
-"""Fase 2 del puente (#20): sondeo con `Z0` de quién escribe/lee `obj+0xd4` (byte de VWF del objeto de fuente).
+"""Sondeo con `Z0` de accesos a un campo de un objeto (quién lo escribe / lo lee) en un ejecutable PS3 bajo RPCS3.
 
-Pone `Z0` en una lista de instrucciones `stb rS,0xd4(rA)` / `lbz rD,0xd4(rA)` / `ld rD,DS(rA)` del EBOOT, y en cada parada registra (JSONL):
+Pone `Z0` en una lista de instrucciones `stb`/`lbz rX,D(rA)` o `ld rD,DS(rA)` del ELF y, en cada parada, registra (JSONL):
 PC, LR, el valor que se guarda (`stb`: byte de rS, decodificado de la palabra de instrucción del ELF) o el byte actual (`lbz`, leído
-por `m`), el objeto (rA), si es un objeto de fuente real (`*(u32*)rA == 0xCFB7E8`, la vtable de docs/vwf_estado.md §2e; no depende de
+por `m` en `rA + D`), el objeto (`rA`), si coincide con el objeto buscado (opcional: `*(u32*)rA == --object-vtable`; no depende de
 direcciones fijas), r3..r10, los 3 primeros marcos de la cadena de retroceso (cada `ret` comprobado contra el ELF: la instrucción
 anterior debe ser un `bl`/`bctrl`/`blrl`) y la etiqueta del paso de la ruta. Luego reanuda: quita el `Z0`, un paso, lo repone, continúa
-(patrón validado en la Fase 0; continuar sin quitar el `Z0` vuelve a parar en el mismo PC).
-Solo funciona con `PPU Decoder: Interpreter (static)`: con LLVM el servidor acepta `Z0` y no para nunca (docs/puente_rpcs3.md, Fase 0).
-Control del costo: tope de registros por clave (sitio, LR, valor, es_fuente) y tope de impactos por sitio (luego se retira el `Z0`).
-Al final, resumen con impactos/s y latencia por ciclo (para decidir entre `Z0` y la cueva de `patch_trace.py`).
+(continuar sin quitar el `Z0` vuelve a parar en el mismo PC).
+Solo funciona con `PPU Decoder: Interpreter (static)`: con LLVM el servidor acepta `Z0` y no para nunca (docs/servidor_gdb_rpcs3.md).
+Vigía (`--watchdog`, por defecto 5 s): un hilo puede quedar parado en un `Z0` sin que el servidor lo comunique; pasados N s sin parada
+se interrumpe y se mira el PC del hilo (docs/bp_probe.md). Control del costo: tope de registros por clave (sitio, LR, valor, coincide)
+y tope de impactos por sitio (luego se retira el `Z0`). Al final, resumen con impactos/s y latencia por ciclo.
 
-Uso (con el proxy en marcha y el juego corriendo; ver docs/puente_rpcs3.md):
-  python3 -I tools/rpcs3_bridge/bp_probe.py --elf work/eboot/EBOOT.elf --sites sitios.txt --out salida.jsonl
-      --log <RPCS3.log> [--thread <id_hex>] [--route tests/rutas/R2.json --route-log <salida>/route.log]
-      [--label-file etiqueta.txt] [--keep-after-route] [--watchdog 5] [--dump ra:0:0x80]... [--all-regs] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
-`sitios.txt`: una línea por sitio, `0xVA [nombre]`; `#` comenta. La salida no debe existir. Si un sitio no es `stb`/`lbz` con
-desplazamiento 0xd4, aborta. No cierra la conexión del proxy; al terminar quita sus `Z0` y deja el juego corriendo.
+Uso (con el proxy en marcha y el juego corriendo; ver docs/bp_probe.md):
+  python3 -I bp_probe.py --elf game.elf --sites sitios.txt --out salida.jsonl [--log <RPCS3.log> | --thread <id_hex>]
+      [--thread-name GameThread] [--object-vtable 0x...] [--field-offset 0x...]
+      [--route ruta.json --route-log <salida>/route.log] [--label-file etiqueta.txt] [--keep-after-route] [--watchdog 5]
+      [--dump ra:0:0x80]... [--all-regs] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
+`sitios.txt`: una línea por sitio, `0xVA [nombre]`; `#` comenta. La salida no debe existir. Si un sitio no es `stb`/`lbz`/`ld`
+(o, con `--field-offset`, un `stb`/`lbz` con otro desplazamiento), aborta. No cierra la conexión del proxy; al terminar quita sus `Z0`
+y deja el juego corriendo.
 """
 import argparse
 import json
@@ -34,19 +37,29 @@ from gdbrsp import Gdb  # noqa: E402
 from validate_server import parse_g  # noqa: E402
 import opd_scan  # noqa: E402
 
-FONT_VTABLE = 0xCFB7E8
+DEFAULT_THREAD_NAME = "GameThread"      # nombre del hilo principal en el log de RPCS3
 BL_LIKE = (0x4E800421, 0x4E800021)      # bctrl, blrl
-DEFAULT_WATCHDOG = 5.0                  # s; las paradas silenciosas son habituales con Z0 (docs/puente_rpcs3.md, Fase 2)
+DEFAULT_WATCHDOG = 5.0                  # s; las paradas silenciosas son habituales con Z0 (docs/bp_probe.md)
 
 
-def decode_site(img, va):
-    """Decodifica del ELF `stb rS,0xd4(rA)`, `lbz rD,0xd4(rA)` o `ld rD,DS(rA)` (forma DS, DS cualquiera). Falla cerrado."""
+def _sx16(v):
+    return v - 0x10000 if v & 0x8000 else v
+
+
+def decode_site(img, va, field_offset=None):
+    """Decodifica del ELF `stb|lbz rX,D(rA)` o `ld rD,DS(rA)` (forma DS). Falla cerrado.
+
+    Devuelve {kind, reg, ra, off} con `off` = desplazamiento con signo de la propia instrucción. Si se da `field_offset`, los `stb`/`lbz`
+    deben usar exactamente ese desplazamiento (validación opcional contra errores en la lista de sitios)."""
     w = img.u32(va)
-    if w is not None and (w >> 26) in (34, 38) and (w & 0xFFFF) == 0xD4:
-        return {"kind": "stb" if (w >> 26) == 38 else "lbz", "reg": (w >> 21) & 31, "ra": (w >> 16) & 31}
+    if w is not None and (w >> 26) in (34, 38):
+        off = _sx16(w & 0xFFFF)
+        if field_offset is not None and off != field_offset:
+            raise ValueError("0x%x: desplazamiento %#x != --field-offset %#x" % (va, off, field_offset))
+        return {"kind": "stb" if (w >> 26) == 38 else "lbz", "reg": (w >> 21) & 31, "ra": (w >> 16) & 31, "off": off}
     if w is not None and (w >> 26) == 58 and (w & 3) == 0:
-        return {"kind": "ld", "reg": (w >> 21) & 31, "ra": (w >> 16) & 31, "off": w & 0xFFFC}
-    raise ValueError("0x%x no es stb/lbz con desplazamiento 0xd4 ni ld (palabra %s)" % (va, "%08x" % w if w is not None else None))
+        return {"kind": "ld", "reg": (w >> 21) & 31, "ra": (w >> 16) & 31, "off": _sx16(w & 0xFFFC)}
+    raise ValueError("0x%x no es stb/lbz ni ld (palabra %s)" % (va, "%08x" % w if w is not None else None))
 
 
 def is_call_return(img, ret):
@@ -116,15 +129,15 @@ class FileLabel:
         return False
 
 
-def find_game_thread(log_path):
-    """Id del hilo `GameThread` según el log de RPCS3 (el id cambia entre arranques)."""
-    pat = re.compile(r"PPU\[0x([0-9a-f]+)\] Thread \(GameThread\)")
+def find_game_thread(log_path, name=DEFAULT_THREAD_NAME):
+    """Id del hilo con ese nombre según el log de RPCS3 (el id cambia entre arranques)."""
+    pat = re.compile(r"PPU\[0x([0-9a-f]+)\] Thread \(" + re.escape(name) + r"\)")
     with open(log_path, encoding="utf-8", errors="replace") as f:
         for ln in f:
             m = pat.search(ln)
             if m:
                 return m.group(1).zfill(16)
-    raise RuntimeError("no hay GameThread en %s: pasar --thread" % log_path)
+    raise RuntimeError("no hay un hilo '%s' en %s: pasar --thread" % (name, log_path))
 
 
 def parse_dumps(specs):
@@ -137,7 +150,7 @@ def parse_dumps(specs):
     return out
 
 
-def load_sites(path, img):
+def load_sites(path, img, field_offset=None):
     sites = {}
     with open(path, encoding="utf-8") as f:
         for ln in f:
@@ -146,7 +159,7 @@ def load_sites(path, img):
                 continue
             p = ln.split(None, 1)
             va = int(p[0], 0)
-            d = decode_site(img, va)
+            d = decode_site(img, va, field_offset)
             d["name"] = p[1] if len(p) > 1 else "%08x" % va
             d["va"] = va
             sites[va] = d
@@ -154,14 +167,15 @@ def load_sites(path, img):
 
 
 class Probe:
-    def __init__(self, g, img, sites, tid, out, label=None, cap_key=10, cap_site=500, dumps=(), all_regs=False):
+    def __init__(self, g, img, sites, tid, out, label=None, cap_key=10, cap_site=500, dumps=(), all_regs=False, object_vtable=None):
         self.g, self.img, self.sites, self.tid, self.out, self.label = g, img, sites, tid, out, label
         self.cap_key, self.cap_site = cap_key, cap_site
+        self.object_vtable = object_vtable      # None: todo impacto coincide (sin comprobar el objeto)
         self.dumps, self.all_regs = list(dumps), all_regs   # dumps: [(nombre, 'ra'|'rN', desplazamiento, largo)]
         self.keys = Counter()                 # (sitio, lr, val, es_fuente) -> veces
         self.site_hits = Counter()
-        self.site_font = Counter()
-        self.nonfont_logged = Counter()
+        self.site_match = Counter()
+        self.nomatch_logged = Counter()
         self.proc_ms, self.wait_ms = [], []
         self.retired = set()
         self.t0 = time.time()
@@ -212,33 +226,36 @@ class Probe:
         pc = r["pc"]
         s = self.sites[pc]
         obj = r["r%d" % s["ra"]]
-        if s["kind"] == "ld":                # el valor que se va a cargar; no hay objeto de fuente que comprobar
+        if s["kind"] == "ld":                # el valor que se va a cargar; no hay objeto que comprobar
             b = self.g.read(obj + s["off"], 8)
             val = int.from_bytes(b, "big") if len(b) == 8 else None
-            vtable, is_font = None, True
+            vtable, match = None, True
         else:
-            vt = self.g.read(obj, 4)
-            vtable = struct.unpack(">I", vt)[0] if len(vt) == 4 else None
-            is_font = vtable == FONT_VTABLE
+            if self.object_vtable is None:
+                vtable, match = None, True
+            else:
+                vt = self.g.read(obj, 4)
+                vtable = struct.unpack(">I", vt)[0] if len(vt) == 4 else None
+                match = vtable == self.object_vtable
             if s["kind"] == "stb":
                 val = r["r%d" % s["reg"]] & 0xFF
             else:
-                b = self.g.read(obj + 0xD4, 1)
+                b = self.g.read(obj + s["off"], 1)
                 val = b[0] if b else None
-        key = (pc, r["lr"], val, is_font)
+        key = (pc, r["lr"], val, match)
         self.keys[key] += 1
         self.site_hits[pc] += 1
-        if is_font:
-            self.site_font[pc] += 1
+        if match:
+            self.site_match[pc] += 1
         self.n += 1
-        log_it = (self.keys[key] <= self.cap_key) if is_font else (self.nonfont_logged[pc] < 3)
-        if log_it and not is_font:
-            self.nonfont_logged[pc] += 1
+        log_it = (self.keys[key] <= self.cap_key) if match else (self.nomatch_logged[pc] < 3)
+        if log_it and not match:
+            self.nomatch_logged[pc] += 1
         rec = None
         if log_it:
             rec = {"t": round(time.time() - self.t0, 3), "n": self.n, "label": self.label.current() if self.label else None,
                    "site": hex(pc), "name": s["name"], "kind": s["kind"], "tid": tid_hit, "lr": hex(r["lr"]), "obj": hex(obj),
-                   "is_font": is_font, "vtable": hex(vtable) if vtable is not None else None, "val": (hex(val) if s["kind"] == "ld" and val is not None else val),
+                   "match": match, "vtable": hex(vtable) if vtable is not None else None, "val": (hex(val) if s["kind"] == "ld" and val is not None else val),
                    "r3_r10": [hex(r["r%d" % i]) for i in range(3, 11)], "r1": hex(r["r1"]),
                    "chain": walk_chain(self.g.read, self.img, r["r1"]), "veces_clave": self.keys[key]}
             if via:
@@ -276,16 +293,16 @@ class Probe:
             return round(sorted(a)[min(len(a) - 1, int(len(a) * p))], 1) if a else None
         dur = time.time() - self.t0
         per_site = {hex(v): {"nombre": self.sites[v]["name"], "tipo": self.sites[v]["kind"], "impactos": self.site_hits[v],
-                             "de_fuente": self.site_font[v], "retirado": v in self.retired,
+                             "coinciden": self.site_match[v], "retirado": v in self.retired,
                              "claves": sum(1 for k in self.keys if k[0] == v)} for v in self.sites}
         valores = defaultdict(Counter)
         for (pc, lr, val, isf), c in self.keys.items():
-            if isf:
+            if isf:   # `isf` = coincide
                 valores[hex(pc)][str(val)] += c
         return {"resumen": {"duracion_s": round(dur, 1), "impactos": self.n, "impactos_por_s": round(self.n / dur, 3) if dur else None,
                             "ms_proceso_mediana": pct(self.proc_ms, 0.5), "ms_proceso_p95": pct(self.proc_ms, 0.95),
                             "ms_espera_mediana": pct(self.wait_ms, 0.5), "por_sitio": per_site,
-                            "valores_en_objetos_de_fuente": {k: dict(v) for k, v in valores.items()}}}
+                            "valores_en_objetos_coincidentes": {k: dict(v) for k, v in valores.items()}}}
 
 
 def wait_stop_or_watchdog(g, t_c, watchdog, deadline, stopping):
@@ -317,11 +334,14 @@ def run_loop(g, p, deadline, watchdog, stop_req, route_over):
 
 
 def build_parser():
-    ap = argparse.ArgumentParser(description="Sondeo con Z0 de las escrituras/lecturas de obj+0xd4")
+    ap = argparse.ArgumentParser(description="Sondeo con Z0 de accesos a un campo de un objeto")
     ap.add_argument("--elf", required=True)
     ap.add_argument("--sites", required=True)
     ap.add_argument("--out", required=True)
-    ap.add_argument("--log", help="RPCS3.log (para hallar el GameThread)")
+    ap.add_argument("--log", help="RPCS3.log (para hallar el hilo por nombre)")
+    ap.add_argument("--thread-name", default=DEFAULT_THREAD_NAME, help="nombre del hilo a depurar en el log (def. %(default)s)")
+    ap.add_argument("--object-vtable", type=lambda x: int(x, 0), default=None, help="si se da, solo los objetos con *(u32*)rA == este valor «coinciden»")
+    ap.add_argument("--field-offset", type=lambda x: int(x, 0), default=None, help="si se da, los stb/lbz de la lista deben usar este desplazamiento")
     ap.add_argument("--thread")
     ap.add_argument("--route")
     ap.add_argument("--route-log")
@@ -344,20 +364,20 @@ def main(argv):
         print("error: %s ya existe" % a.out, file=sys.stderr)
         return 1
     img = opd_scan.Image.from_elf(a.elf)
-    sites = load_sites(a.sites, img)
+    sites = load_sites(a.sites, img, a.field_offset)
     if not sites:
         print("error: sin sitios", file=sys.stderr)
         return 1
     if len(sites) > a.max_bps:
         print("error: %d sitios > --max-bps %d (subir de a poco; el techo del servidor no está medido)" % (len(sites), a.max_bps), file=sys.stderr)
         return 1
-    tid = a.thread.zfill(16) if a.thread else find_game_thread(a.log)
+    tid = a.thread.zfill(16) if a.thread else find_game_thread(a.log, a.thread_name)
     label = RouteLabel(a.route, a.route_log) if a.route and a.route_log else (FileLabel(a.label_file) if a.label_file else None)
     g = Gdb("127.0.0.1", a.port, timeout=30.0)
     g.cmd("Hg" + tid)
     g.cmd("Hc" + tid)
     with open(a.out, "x", encoding="utf-8") as out:
-        p = Probe(g, img, sites, tid, out, label, a.cap_key, a.cap_site, parse_dumps(a.dump), a.all_regs)
+        p = Probe(g, img, sites, tid, out, label, a.cap_key, a.cap_site, parse_dumps(a.dump), a.all_regs, a.object_vtable)
         p.emit({"evento": "inicio", "hilo": tid, "sitios": {hex(v): d for v, d in sites.items()}, "cap_key": a.cap_key, "cap_site": a.cap_site})
         for va in sites:
             if not g.bp(va):
