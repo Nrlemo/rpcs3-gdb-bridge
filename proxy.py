@@ -38,7 +38,6 @@ import socket
 import sys
 import time
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TRUNC = 200
 
 
@@ -306,7 +305,7 @@ def main(argv) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--upstream", default="127.0.0.1:2345")
     ap.add_argument("--listen", default="127.0.0.1:2346")
-    ap.add_argument("--log", default=os.path.join(ROOT, "work/tmp/bridge", time.strftime("%Y%m%d_%H%M%S") + ".jsonl"))
+    ap.add_argument("--log", default=os.path.join(os.getcwd(), "rpcs3_bridge_logs", time.strftime("%Y%m%d_%H%M%S") + ".jsonl"))
     ap.add_argument("--allow-kill", action="store_true")
     ap.add_argument("--no-translate", action="store_true")
     a = ap.parse_args(argv[1:])

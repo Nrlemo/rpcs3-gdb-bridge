@@ -12,11 +12,10 @@ import sys
 import time
 from collections import Counter
 
-ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(ROOT, "tools"))
-sys.path.insert(0, os.path.join(ROOT, "tools", "rpcs3_bridge"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 from gdbrsp import Gdb  # noqa: E402
-from fase0 import parse_g, in_code  # noqa: E402
+from validate_server import parse_g, in_code  # noqa: E402
 
 R = {}
 

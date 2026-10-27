@@ -9,7 +9,7 @@ import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "tools"))
+sys.path.insert(0, ROOT)
 import opd_scan as o  # noqa: E402
 
 BASE, CODE_END, DATA_END, TOC = 0x10000, 0x11000, 0x12000, 0x11800

@@ -12,8 +12,7 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "tools"))
-sys.path.insert(0, os.path.join(ROOT, "tools", "rpcs3_bridge"))
+sys.path.insert(0, ROOT)
 import bp_probe as bp  # noqa: E402
 import opd_scan  # noqa: E402
 

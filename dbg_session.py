@@ -21,13 +21,14 @@ import time
 import traceback
 import contextlib
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(ROOT, "tools"))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+ROOT = os.getcwd()   # directorio desde el que se lanzó; se expone a los fragmentos
 from gdbrsp import Gdb  # noqa: E402
 
 
 def main(argv) -> int:
-    d = argv[1] if len(argv) > 1 else os.path.join(ROOT, "work/tmp/dbg")
+    d = argv[1] if len(argv) > 1 else os.path.join(ROOT, "dbg_session")
     for sub in ("in", "out", "done"):
         os.makedirs(os.path.join(d, sub), exist_ok=True)
     log = open(os.path.join(d, "session.log"), "a", buffering=1)
