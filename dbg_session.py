@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Sesión de depuración persistente contra el servidor GDB de RPCS3.
 
-Existe por una limitación del servidor (ver `tools/gdbrsp.py`): **si el cliente cierra el socket, el
+Existe por una limitación del servidor (ver `gdbrsp.py`): **si el cliente cierra el socket, el
 hilo del servidor muere y el emulador queda congelado**. Como además solo se admite una conexión por
-arranque, y cada arranque del juego cuesta ~6 min, no se puede explorar con invocaciones sueltas:
+arranque, y cada arranque cuesta varios minutos, no se puede explorar con invocaciones sueltas:
 hace falta un proceso que mantenga la conexión abierta mientras se le mandan trabajos.
 
 Este proceso se queda vivo, con el socket abierto, y ejecuta los fragmentos de Python que aparezcan
 en `<dir>/in/` (por orden alfabético), con el objeto `Gdb` disponible como `g`. La salida de cada
 fragmento va a `<dir>/out/<nombre>.txt` y el fragmento se mueve a `<dir>/done/`.
 
-Uso: python3 -I tools/dbg_session.py [<dir=work/tmp/dbg>]
-     # y desde fuera:  cp trabajo.py work/tmp/dbg/in/01_trabajo.py ; esperar work/tmp/dbg/out/01_trabajo.py.txt
+Uso: python3 -I dbg_session.py [<dir=./dbg_session>]
+     # y desde fuera:  cp trabajo.py dbg_session/in/01_trabajo.py ; esperar dbg_session/out/01_trabajo.py.txt
 Terminar: matar el proceso (el emulador quedará congelado: hacerlo solo al final de la corrida).
 """
 import io

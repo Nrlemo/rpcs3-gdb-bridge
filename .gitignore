@@ -1,0 +1,30 @@
+# Caché y entorno de Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Artefactos que NUNCA deben versionarse: programas, volcados de memoria, capturas, registros y datos de un juego
+*.elf
+*.self
+*.sprx
+*.bin
+*.iso
+*.pkg
+*.psarc
+*.sdat
+*.wtd
+*.png
+*.jpg
+*.jpeg
+*.dds
+*.jsonl
+*.log
+*.gz
+*.zip
+
+# Salidas de trabajo de las herramientas
+rpcs3_bridge_logs/
+dbg_session/
+dumps/
+capturas/
+work/

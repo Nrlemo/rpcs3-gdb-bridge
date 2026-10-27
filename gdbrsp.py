@@ -10,17 +10,17 @@ IMPORTANTE (leído en `rpcs3/Emu/GDB.cpp` y verificado en el log):
   * **No hay forma de desconectarse.** El servidor no implementa `D`, y cuando `recv` devuelve 0
     (el cliente cerró) lanza el error fatal «Tried to read char, but no data was available»: el hilo
     muere y **el emulador queda congelado**. O sea: una sola sesión por arranque, y el proceso cliente
-    no puede terminar mientras se quiera seguir usando el juego (ver `tools/dbg_session.py`).
+    no puede terminar mientras se quiera seguir usando el programa (ver `dbg_session.py` y `proxy.py`).
   * **`m` no respeta el `PacketSize` anunciado** (0x1200): acepta cualquier longitud y responde en un
     solo paquete. Como el coste por paquete es fijo (~41 ms), conviene leer en bloques grandes.
     Devuelve lo leído hasta la primera dirección inválida (una respuesta corta marca el fin del tramo).
 La memoria solo se puede leer con el emulador detenido.
 
 Uso:
-  python3 -I tools/gdbrsp.py probe                      capacidades del servidor y soporte de breakpoints/watchpoints
-  python3 -I tools/gdbrsp.py read <addr> <len>          vuelca memoria (hex + ASCII)
-  python3 -I tools/gdbrsp.py search <hex|str:TEXTO> [ini] [fin]   busca un patrón en memoria
-  python3 -I tools/gdbrsp.py regs                       registros del hilo actual
+  python3 -I gdbrsp.py probe                      capacidades del servidor y soporte de breakpoints/watchpoints
+  python3 -I gdbrsp.py read <addr> <len>          vuelca memoria (hex + ASCII)
+  python3 -I gdbrsp.py search <hex|str:TEXTO> [ini] [fin]   busca un patrón en memoria
+  python3 -I gdbrsp.py regs                       registros del hilo actual
 Direcciones en hex (0x...) o decimal.
 """
 import binascii
@@ -116,7 +116,7 @@ class Gdb:
 
     def cont(self):
         """Reanuda la emulación. No espera respuesta (el servidor solo contesta al parar)."""
-        # Sin drain(): podría comerse una parada pendiente (docs/depuracion_gdb_rpcs3.md, «Breakpoints»).
+        # Sin drain(): podría comerse una parada pendiente (docs/servidor_gdb_rpcs3.md, «Reanudar y paradas»).
         self._send("c")
         self.running = True
 
