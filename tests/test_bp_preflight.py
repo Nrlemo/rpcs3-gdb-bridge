@@ -540,6 +540,169 @@ class TestMakeAlternates(unittest.TestCase):
         self.assertEqual(out, [])
 
 
+SC, LI_R3_30, TRAP = 0x44000002, 0x3860001E, 0x7FE00008           # sc; li r3,30; tw 31,0,0 (no está en la tabla mínima)
+
+
+def img_with(words, base=0x20010, code_end=None):
+    data = struct.pack(">%dI" % len(words), *words)
+    return opd_scan.Image([(base, data)], [(base, code_end if code_end else base + len(data))])
+
+
+class TestContextoInstruccion(unittest.TestCase):
+    """Contexto de instrucción: SIMULADO (imágenes sintéticas); no valida nada sobre RPCS3 real."""
+
+    def test_sc_conocido(self):
+        c = pf.instruction_context(img_with([SC]), 0x20010)
+        self.assertEqual((c["en_codigo"], c["palabra"], c["mnemonico"], c["es_sc"], c["estado"]), (True, "44000002", "sc", True, "ok"))
+        self.assertIn("ELF", c["metodo"])
+
+    def test_no_sc_conocidos_y_no_reconocidos(self):
+        img = img_with([LI_R3_30, 0x60000000, 0x48000001, 0x4E800020, TRAP])
+        got = [pf.instruction_context(img, 0x20010 + 4 * i) for i in range(5)]
+        self.assertEqual([(g["mnemonico"], g["es_sc"], g["estado"]) for g in got],
+                         [("li", False, "ok"), ("nop", False, "ok"), ("bl", False, "ok"), ("blr", False, "ok"),
+                          (None, False, "mnemonico_no_reconocido")])          # una palabra sin mnemónico NO se inventa; sí se sabe que no es sc
+
+    def test_opcode_17_no_estandar_no_se_decide(self):
+        c = pf.instruction_context(img_with([0x44000022]), 0x20010)             # «sc 1»: no es la palabra exacta de sc
+        self.assertEqual((c["mnemonico"], c["es_sc"], c["estado"]), (None, None, "opcode_17_no_estandar"))
+
+    def test_pc_fuera_del_codigo(self):
+        c = pf.instruction_context(img_with([SC]), 0x90000)
+        self.assertEqual((c["en_codigo"], c["palabra"], c["es_sc"], c["estado"]), (False, None, None, "fuera_del_codigo"))
+
+    def test_sin_elf(self):
+        c = pf.instruction_context(None, 0x20010)
+        self.assertEqual((c["en_codigo"], c["palabra"], c["es_sc"], c["estado"]), (None, None, None, "sin_elf"))
+
+    def test_palabra_truncada_o_ilegible(self):
+        img = opd_scan.Image([(0x20010, b"\x44\x00")], [(0x20010, 0x20020)])    # el segmento tiene 2 bytes pero el rango dice 16
+        c = pf.instruction_context(img, 0x20010)
+        self.assertEqual((c["en_codigo"], c["palabra"], c["es_sc"], c["estado"]), (True, None, None, "palabra_ilegible"))
+
+    def test_decode_word_exacto(self):
+        self.assertEqual(pf.decode_word(SC), ("sc", True, "ok"))
+        self.assertEqual(pf.decode_word(0x38600000 | 5), ("li", False, "ok"))
+        self.assertEqual(pf.decode_word(0x38630005), (None, False, "mnemonico_no_reconocido"))   # addi r3,r3,5: ra != 0, no es li
+
+    def test_registro_de_intento_sin_instr_info_dice_sin_elf(self):
+        g = ScriptedGdb({"g": g_pkt(PC), "?": "S05"}, wait=TimeoutError())
+        r = pf.check_breakpoints(g, TID, 0.1)
+        i = r.attempts[0]["instruccion"]
+        self.assertEqual((i["estado"], i["es_sc"]), ("sin_elf", None))
+        self.assertEqual(r.attempts[0]["desenlace"], "mismo_pc")
+        self.assertIsNone(r.attempts[0]["decoder_ppu"])
+
+    def test_es_solo_observacional_el_resultado_no_cambia(self):
+        def run(**kw):
+            g = ScriptedGdb({"g": g_pkt(PC), "?": "S05"}, wait=[TimeoutError(), TimeoutError()])
+            r = pf.check_breakpoints(g, TID, 0.1, alternates=alts(ALT_A), **kw)
+            d = r.to_dict()
+            for a in d["intentos"]:
+                a.pop("segundos"), a.pop("instruccion", None), a.pop("decoder_ppu", None)
+            d["decoder_ppu"] = None
+            return d, g.calls
+        base, calls0 = run()
+        con, calls1 = run(instr_info=pf.make_instr_info(img_with([SC])), ppu_decoder={"valor": "Interpreter (static)", "fuente": "operador"})
+        self.assertEqual(base, con)                                              # mismo veredicto, motivos, intentos y limpieza
+        self.assertEqual(calls0, calls1)                                         # mismas órdenes al servidor
+
+    def test_un_fallo_del_decodificador_no_afecta_al_resultado(self):
+        def boom(addr):
+            raise RuntimeError("decodificador roto")
+        g = ScriptedGdb({"g": g_pkt(PC), "?": "S05"}, wait=TimeoutError())
+        r = pf.check_breakpoints(g, TID, 0.1, instr_info=boom)
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
+        i = r.attempts[0]["instruccion"]
+        self.assertEqual((i["estado"], i["es_sc"]), ("error_de_decodificacion", None))
+        self.assertIn("RuntimeError", i["detalle"])
+        self.assertTrue(r.cleanup_ok)
+
+    def test_json_serializable_y_campos_anteriores_intactos(self):
+        g = ScriptedGdb({"g": g_pkt(PC), "?": "S05"}, wait=TimeoutError())
+        r = pf.check_breakpoints(g, TID, 0.1, instr_info=pf.make_instr_info(img_with([SC])), ppu_decoder={"valor": "LLVM", "fuente": "operador"})
+        d = json.loads(json.dumps(r.to_dict()))
+        a = d["intentos"][0]
+        for k in ("n", "origen", "hilo", "pc", "timeout_s", "veredicto", "motivo", "limpieza_ok", "segundos", "respuesta_z0", "reintentable"):
+            self.assertIn(k, a)                                                  # compatibilidad: los campos de antes siguen
+        self.assertEqual(a["instruccion"]["mnemonico"], "sc")
+        self.assertTrue(a["instruccion"]["es_sc"])
+        self.assertEqual((a["desenlace"], a["decoder_ppu"]["valor"], d["decoder_ppu"]["fuente"]), ("mismo_pc", "LLVM", "operador"))
+
+    def test_decoder_desde_el_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            lg = os.path.join(d, "RPCS3.log")
+            with open(lg, "w") as f:
+                f.write("x\n  PPU Decoder: Recompiler (LLVM)\n  SPU Decoder: Recompiler (LLVM)\n  PPU Decoder: otro\n")
+            self.assertEqual(pf.ppu_decoder_from_log(lg), "Recompiler (LLVM)")        # la primera
+            self.assertIsNone(pf.ppu_decoder_from_log(os.path.join(d, "no_existe.log")))
+            with open(lg, "w") as f:
+                f.write("sin la línea\n")
+            self.assertIsNone(pf.ppu_decoder_from_log(lg))
+
+
+class TestDesenlaceYContextoConMock(Base):
+    """Gdb real -> proxy real -> servidor SIMULADO."""
+
+    def setUp(self):
+        super().setUp()
+        self.info = pf.make_instr_info(img_with([SC]))         # el PC simulado (0x20010) es un sc del ELF sintético
+
+    def test_paro_en_el_pc(self):
+        self.mock.honor_bps = True
+        r = self.check(instr_info=self.info)
+        a = r.attempts[0]
+        self.assertEqual((r.verdict, a["desenlace"], a["instruccion"]["es_sc"]), (pf.PASS, "paro_en_pc", True))
+        self.assertEqual(a["pc_tras_parada"], hex(PC))
+
+    def test_avanzo(self):
+        self.mock.advance_on_cont = True
+        r = self.check(instr_info=self.info)
+        self.assertEqual((r.verdict, r.attempts[0]["desenlace"]), (pf.FAIL, "avanzo"))
+
+    def test_mismo_pc(self):
+        self.mock.honor_bps, self.mock.silent_pcs = True, {PC}
+        r = self.check(instr_info=self.info)
+        self.assertEqual((r.verdict, r.attempts[0]["desenlace"]), (pf.INCONCLUSIVE, "mismo_pc"))
+
+    def test_sin_dato_si_no_se_llego_a_poner_el_z0(self):
+        self.mock.pc = PC + 2                                  # desalineado: no se prueba nada
+        r = self.check(instr_info=self.info)
+        self.assertEqual((r.verdict, r.attempts[0]["desenlace"]), (pf.INCONCLUSIVE, "sin_dato"))
+        self.assertFalse(any(c.startswith("Z0") for c in self.mock.seen))
+
+
+class TestCliContexto(Base):
+    """CLI de punta a punta con el servidor SIMULADO y un ELF sintético (Image.from_elf parcheado)."""
+    connect = False
+
+    def test_json_con_instruccion_y_decoder_del_log(self):
+        self.mock.honor_bps = True
+        with tempfile.TemporaryDirectory() as d:
+            lg, out = os.path.join(d, "RPCS3.log"), os.path.join(d, "r.json")
+            with open(lg, "w") as f:
+                f.write("  PPU Decoder: Interpreter (static)\n")
+            with mock.patch.object(opd_scan.Image, "from_elf", return_value=img_with([SC])), contextlib.redirect_stdout(io.StringIO()):
+                rc = pf.main(["bp_preflight.py", "--thread", TID, "--elf", "x.elf", "--log", lg, "--port", str(self.port), "--timeout", "0.5", "--json", out])
+            self.assertEqual(rc, 0)
+            r = json.load(open(out, encoding="utf-8"))
+        a = r["intentos"][0]
+        self.assertEqual((a["instruccion"]["mnemonico"], a["instruccion"]["es_sc"], a["desenlace"]), ("sc", True, "paro_en_pc"))
+        self.assertEqual(r["decoder_ppu"], {"valor": "Interpreter (static)", "fuente": "RPCS3.log (primera línea «PPU Decoder:»)"})
+
+    def test_el_operador_manda_sobre_el_log(self):
+        self.mock.honor_bps = True
+        with tempfile.TemporaryDirectory() as d:
+            lg, out = os.path.join(d, "RPCS3.log"), os.path.join(d, "r.json")
+            with open(lg, "w") as f:
+                f.write("  PPU Decoder: Interpreter (static)\n")
+            with contextlib.redirect_stdout(io.StringIO()):
+                pf.main(["bp_preflight.py", "--thread", TID, "--log", lg, "--ppu-decoder", "Recompiler (LLVM)", "--port", str(self.port), "--timeout", "0.5", "--json", out])
+            r = json.load(open(out, encoding="utf-8"))
+        self.assertEqual(r["decoder_ppu"], {"valor": "Recompiler (LLVM)", "fuente": "operador"})
+        self.assertEqual(r["intentos"][0]["instruccion"]["estado"], "sin_elf")        # sin --elf no hay decodificación
+
+
 class TestInforme(unittest.TestCase):
     def test_informe_conciso_y_codigos_de_salida(self):
         self.assertEqual(pf.EXIT_CODES, {pf.PASS: 0, pf.FAIL: 1, pf.INCONCLUSIVE: 3})

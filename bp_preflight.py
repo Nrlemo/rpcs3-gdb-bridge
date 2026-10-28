@@ -24,8 +24,14 @@ completo (Z0, parada con señal 05 en esa dirección, control sin breakpoint, li
 intento alternativo SOLO puede dar PASS o INCONCLUSIVE: que el hilo no pare o se mueva no prueba que ejecutara esa dirección, así que
 no hay FAIL por reintento. No avanza el hilo con `s`, no cambia de hilo y no suma al PC.
 
+Contexto de instrucción (solo observacional; no cambia el veredicto, el timeout ni los reintentos): cada registro de intento incluye
+`instruccion` (PC, si cae en el código del ELF, palabra del ELF, mnemónico de una tabla mínima propia, `es_sc`, estado y método),
+`desenlace` (paró en el PC / avanzó / siguió en el mismo PC / sin dato) y `decoder_ppu` (de --ppu-decoder o de la línea «PPU Decoder:» del
+log). La palabra sale SOLO del ELF (no se lee memoria del juego): no detecta código parcheado en ejecución. Sin ELF, fuera del código o con
+una palabra ilegible se registra el estado y `es_sc: null`; nunca se supone «no sc».
+
 Uso: python3 -I bp_preflight.py (--thread <id_hex> | --log RPCS3.log [--thread-name GameThread]) [--elf programa.elf | --code lo-hi]
-         [--timeout 5] [--attempts 3] [--no-control] [--no-resume] [--json salida.json] [--port 2346]
+         [--timeout 5] [--attempts 3] [--no-control] [--no-resume] [--json salida.json] [--ppu-decoder TEXTO] [--port 2346]
 `--json` guarda el resultado completo (un registro por intento; el archivo no debe existir). `--timeout` es por intento; cota total ≈ attempts × (timeout + CONTROL_TIMEOUT + limpieza). Los reintentos con direcciones de retorno
 exigen --elf. Código de salida: 0 PASS, 1 FAIL, 3 INCONCLUSIVE, 2 uso incorrecto.
 """
@@ -54,7 +60,8 @@ class Result:
         self.verdict, self.reason, self.address, self.cleanup_ok = verdict, reason, address, cleanup_ok
         self.retryable = retryable      # INCONCLUSIVE por «sin parada y PC sin cambios»: otra dirección válida puede dar evidencia
         self.notes = []
-        self.attempts = []              # un dict por intento (ver _record)
+        self.attempts = []              # un dict por intento (ver _attempt)
+        self.ppu_decoder = None         # {"valor", "fuente"} indicado por el operador o leído del log; None si no se indicó
 
     @property
     def allows_probe(self):
@@ -64,7 +71,8 @@ class Result:
     def to_dict(self):
         """Resumen serializable (JSON) para dejar constancia, p. ej. en el evento `inicio` de bp_probe."""
         return {"veredicto": self.verdict, "motivo": self.reason, "pc": hex(self.address) if self.address is not None else None,
-                "limpieza_ok": self.cleanup_ok, "notas": list(self.notes), "intentos": [dict(a) for a in self.attempts]}
+                "limpieza_ok": self.cleanup_ok, "notas": list(self.notes), "decoder_ppu": self.ppu_decoder,
+                "intentos": [dict(a) for a in self.attempts]}
 
     def report(self):
         lines = ["preflight de breakpoints: %s%s" % (self.verdict, " (PC 0x%x)" % self.address if self.address is not None else ""),
@@ -79,6 +87,72 @@ class Result:
         if self.verdict == INCONCLUSIVE:
             lines.append("  Un resultado inconcluso NO prueba que falten breakpoints; ver README (límites).")
         return "\n".join(lines)
+
+
+METODO_INSTRUCCION = "palabra del ELF (opd_scan.Image.u32) + tabla mínima propia de codificaciones exactas (sc, nop, b/bl/ba/bla, blr/blrl/bctr/bctrl, li)"
+_EXACTAS = {0x44000002: "sc", 0x60000000: "nop", 0x4E800020: "blr", 0x4E800021: "blrl", 0x4E800420: "bctr", 0x4E800421: "bctrl"}
+
+
+def decode_word(w):
+    """(mnemónico | None, es_sc | None, estado) de una palabra de instrucción PPC. Solo reconoce lo que está en la tabla mínima:
+    el resto da mnemónico None. `es_sc` es True solo para la palabra exacta de `sc` (LEV 0), None para otras palabras del código de
+    operación 17 (formas no estándar: no se decide) y False para cualquier otra, de la que se sabe con certeza que no es `sc`."""
+    if w in _EXACTAS:
+        return _EXACTAS[w], w == 0x44000002, "ok"
+    op = w >> 26
+    if op == 17:
+        return None, None, "opcode_17_no_estandar"
+    if op == 18:
+        return ("b", "bl", "ba", "bla")[w & 3], False, "ok"
+    if op == 14 and ((w >> 16) & 31) == 0:
+        return "li", False, "ok"
+    return None, False, "mnemonico_no_reconocido"
+
+
+def instruction_context(img, addr):
+    """Qué instrucción hay en `addr` según el ELF `img` (None si no hay ELF). Nunca adivina y nunca lee memoria del juego."""
+    ctx = {"pc": hex(addr), "en_codigo": None, "palabra": None, "mnemonico": None, "es_sc": None, "estado": "sin_elf",
+           "metodo": METODO_INSTRUCCION}
+    if img is None:
+        return ctx
+    if not img.in_code(addr):
+        ctx.update(en_codigo=False, estado="fuera_del_codigo")
+        return ctx
+    ctx["en_codigo"] = True
+    w = img.u32(addr)
+    if w is None:
+        ctx["estado"] = "palabra_ilegible"
+        return ctx
+    mn, es_sc, estado = decode_word(w)
+    ctx.update(palabra="%08x" % w, mnemonico=mn, es_sc=es_sc, estado=estado)
+    return ctx
+
+
+def make_instr_info(img):
+    """`instr_info` para check_breakpoints a partir de un opd_scan.Image (o None: «sin_elf»)."""
+    return lambda addr: instruction_context(img, addr)
+
+
+def ppu_decoder_from_log(path):
+    """Valor de la línea «PPU Decoder:» del log de RPCS3 (la primera), o None. Es lo que decía la configuración, no una medición."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                m = re.match(r"^\s*PPU Decoder:\s*(.+?)\s*$", ln)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def _desenlace(rec, addr):
+    """Qué se observó del hilo en este intento: paró en el PC, paró en otro, avanzó, siguió en el mismo PC o sin dato."""
+    if rec.get("pc_tras_parada") is not None:
+        return "paro_en_pc" if rec["pc_tras_parada"] == hex(addr) else "paro_en_otro_pc"
+    if rec.get("pc_tras_interrupcion") is not None:
+        return "mismo_pc" if rec["pc_tras_interrupcion"] == hex(addr) else "avanzo"
+    return "sin_dato"
 
 
 def _stop_signal(pkt):
@@ -102,18 +176,21 @@ def _valid_target(addr, avoid, is_code):
     return None
 
 
-def check_breakpoints(g, tid, timeout=5.0, avoid=(), is_code=None, control=True, resume=False, attempts=DEFAULT_ATTEMPTS, alternates=None):
+def check_breakpoints(g, tid, timeout=5.0, avoid=(), is_code=None, control=True, resume=False, attempts=DEFAULT_ATTEMPTS, alternates=None,
+                      instr_info=None, ppu_decoder=None):
     """Ejecuta la verificación sobre una conexión `Gdb` (o el proxy). Nunca lanza por errores de protocolo/conexión.
 
     `tid`: hilo (hex de 16 cifras) cuyo PC actual se usa; `avoid`: direcciones con breakpoints ya conocidos por el llamador;
     `is_code(addr)`: opcional, ¿la dirección está en el código del programa?; `control`: exige que continuar sin breakpoint no pare;
     `resume`: al terminar con limpieza correcta, reanuda el objetivo (si no, queda detenido como estaba al entrar);
     `attempts`: intentos en total (ver el docstring del módulo); `alternates(regs, read)`: devuelve [(dirección, etiqueta)] de
-    direcciones que el llamador pudo validar como código; se consulta una sola vez y solo tras «plazo vencido con el PC sin cambios»."""
+    direcciones que el llamador pudo validar como código; se consulta una sola vez y solo tras «plazo vencido con el PC sin cambios».
+    `instr_info(addr)` (p. ej. make_instr_info) y `ppu_decoder` ({"valor", "fuente"}) solo enriquecen los registros: no influyen en nada más."""
     avoid = set(avoid)
     attempts = max(1, attempts)
     records, tried = [], set()
-    res = _attempt(g, tid, timeout, avoid, is_code, control, None, "pc_actual", 1, records)
+    ctx = (instr_info, ppu_decoder)
+    res = _attempt(g, tid, timeout, avoid, is_code, control, None, "pc_actual", 1, records, ctx)
     if res.address is not None:
         tried.add(res.address)
     candidates = None
@@ -128,10 +205,11 @@ def check_breakpoints(g, tid, timeout=5.0, avoid=(), is_code=None, control=True,
             res.notes.append("sin reintento: no hay otra dirección alternativa válida (retornos del hilo fuera del ELF, repetidos o con breakpoint conocido)")
             break
         tried.add(cand[0])
-        res = _attempt(g, tid, timeout, avoid, is_code, control, cand[0], cand[1], len(records) + 1, records)
+        res = _attempt(g, tid, timeout, avoid, is_code, control, cand[0], cand[1], len(records) + 1, records, ctx)
     if res.retryable and res.cleanup_ok and len(records) >= attempts > 1:
         res.notes.append("límite de %d intentos alcanzado" % attempts)
     res.attempts = records
+    res.ppu_decoder = ppu_decoder
     if len(records) > 1 and res.verdict == PASS:
         res.notes.append("PASS en el intento %d tras intentos previos sin evidencia; solo vale para esa dirección y ese hilo" % len(records))
     if g.running:                   # p. ej. una interrupción fallida
@@ -157,7 +235,7 @@ def _candidates(g, alternates):
         return [], "error al buscar direcciones alternativas: %s: %s" % (type(e).__name__, e)
 
 
-def _attempt(g, tid, timeout, avoid, is_code, control, target, origen, n, records):
+def _attempt(g, tid, timeout, avoid, is_code, control, target, origen, n, records, ctx=(None, None)):
     """Un intento completo (con limpieza) y su registro. `target` None = PC actual del hilo."""
     t0 = time.time()
     state = {"installed": False, "addr": None, "rec": {}}
@@ -173,6 +251,14 @@ def _attempt(g, tid, timeout, avoid, is_code, control, target, origen, n, record
            "veredicto": res.verdict, "motivo": res.reason, "limpieza_ok": res.cleanup_ok, "reintentable": res.retryable,
            "segundos": round(time.time() - t0, 2)}
     rec.update(state["rec"])
+    instr_info, ppu_decoder = ctx
+    if res.address is not None:                        # solo observacional: un fallo aquí no puede afectar al resultado
+        try:
+            rec["instruccion"] = (instr_info or (lambda a: instruction_context(None, a)))(res.address)
+        except Exception as e:      # noqa: BLE001
+            rec["instruccion"] = {"pc": hex(res.address), "estado": "error_de_decodificacion", "es_sc": None, "detalle": "%s: %s" % (type(e).__name__, e)}
+        rec["desenlace"] = _desenlace(rec, res.address)
+    rec["decoder_ppu"] = ppu_decoder
     records.append(rec)
     return res
 
@@ -293,6 +379,7 @@ def build_parser():
     ap.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS, help="intentos en total; los reintentos usan otra dirección de retorno del hilo validada contra el ELF (def. %(default)s; 1 = sin reintentos)")
     ap.add_argument("--no-control", action="store_true", help="omitir el control sin breakpoint")
     ap.add_argument("--no-resume", action="store_true", help="dejar el objetivo detenido al terminar")
+    ap.add_argument("--ppu-decoder", help="decoder PPU en uso, tal como lo indica el operador (si no, se toma del log con --log); solo se registra")
     ap.add_argument("--json", help="guardar el resultado completo, con un registro por intento (no debe existir)")
     ap.add_argument("--port", type=int, default=2346)
     return ap
@@ -311,10 +398,17 @@ def main(argv):
         return 2
     tid = a.thread.zfill(16) if a.thread else find_game_thread(a.log, a.thread_name)
     ranges = validate_server.set_code_ranges(a.elf, a.code)
-    alternates = make_alternates(opd_scan.Image.from_elf(a.elf)) if a.elf else None
+    img = opd_scan.Image.from_elf(a.elf) if a.elf else None
+    alternates = make_alternates(img) if img else None
+    if a.ppu_decoder:
+        dec = {"valor": a.ppu_decoder, "fuente": "operador"}
+    else:
+        v = ppu_decoder_from_log(a.log) if a.log else None
+        dec = {"valor": v, "fuente": "RPCS3.log (primera línea «PPU Decoder:»)"} if v else None
     g = Gdb("127.0.0.1", a.port, timeout=30.0)
     res = check_breakpoints(g, tid, a.timeout, is_code=validate_server.in_code if ranges else None,
-                            control=not a.no_control, resume=not a.no_resume, attempts=a.attempts, alternates=alternates)
+                            control=not a.no_control, resume=not a.no_resume, attempts=a.attempts, alternates=alternates,
+                            instr_info=make_instr_info(img), ppu_decoder=dec)
     print(res.report())
     if a.json:
         with open(a.json, "x", encoding="utf-8") as f:

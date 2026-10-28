@@ -399,7 +399,10 @@ def main(argv):
     label = RouteLabel(a.route, a.route_log) if a.route and a.route_log else (FileLabel(a.label_file) if a.label_file else None)
     g = Gdb("127.0.0.1", a.port, timeout=30.0)
     pre = bp_preflight.check_breakpoints(g, tid, a.preflight_timeout, avoid=sites, is_code=img.in_code,
-                                        attempts=a.preflight_attempts, alternates=make_alternates(img))
+                                        attempts=a.preflight_attempts, alternates=make_alternates(img),
+                                        instr_info=bp_preflight.make_instr_info(img),
+                                        ppu_decoder=({"valor": v, "fuente": "RPCS3.log (primera línea «PPU Decoder:»)"}
+                                                     if a.log and (v := bp_preflight.ppu_decoder_from_log(a.log)) else None))
     print(pre.report(), file=sys.stderr)
     if not pre.cleanup_ok:
         print("error: la verificación previa dejó el estado sucio; no se continúa (ni con --ignore-preflight)", file=sys.stderr)
