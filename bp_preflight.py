@@ -16,7 +16,9 @@ Límite: el protocolo no permite listar breakpoints existentes; si el hilo está
 RPCS3, el `z0` de limpieza lo quitaría. Correr la verificación antes de poner breakpoints propios.
 
 Uso: python3 -I bp_preflight.py (--thread <id_hex> | --log RPCS3.log [--thread-name GameThread]) [--elf programa.elf | --code lo-hi]
-         [--timeout 5] [--no-control] [--no-resume] [--port 2346]
+         [--timeout 5] [--attempts 3] [--no-control] [--no-resume] [--port 2346]
+Si un intento da «sin parada y el hilo en el mismo PC» (ni FAIL ni PASS: parada silenciosa o hilo bloqueado), avanza el hilo una
+instrucción con `s` (sin breakpoint) y repite en el PC nuevo, hasta --attempts; un paso que no responde o no mueve el PC corta los reintentos.
 Código de salida: 0 PASS, 1 FAIL, 3 INCONCLUSIVE, 2 uso incorrecto.
 """
 import argparse
@@ -34,11 +36,14 @@ EXIT_CODES = {PASS: 0, FAIL: 1, INCONCLUSIVE: 3}
 STOP_RE = re.compile(r"^[ST]([0-9a-fA-F]{2})")
 CONTROL_TIMEOUT = 1.0           # s sin parada que se exigen al control sin breakpoint
 CLEANUP_TIMEOUT = 20.0          # s para que el servidor conteste a una interrupción
+STEP_TIMEOUT = 3.0              # s para un paso (`s`) entre intentos: un paso sobre un hilo bloqueado no termina (regla 6)
+DEFAULT_ATTEMPTS = 3
 
 
 class Result:
-    def __init__(self, verdict, reason, address=None, cleanup_ok=True):
+    def __init__(self, verdict, reason, address=None, cleanup_ok=True, retryable=False):
         self.verdict, self.reason, self.address, self.cleanup_ok = verdict, reason, address, cleanup_ok
+        self.retryable = retryable      # INCONCLUSIVE por «sin parada y PC sin cambios»: otro PC puede dar evidencia
         self.notes = []
 
     @property
@@ -67,25 +72,64 @@ def _regs(g):
     return r if "pc" in r else None
 
 
-def check_breakpoints(g, tid, timeout=5.0, avoid=(), is_code=None, control=True, resume=False):
+def check_breakpoints(g, tid, timeout=5.0, avoid=(), is_code=None, control=True, resume=False, attempts=DEFAULT_ATTEMPTS,
+                      step_timeout=STEP_TIMEOUT):
     """Ejecuta la verificación sobre una conexión `Gdb` (o el proxy). Nunca lanza por errores de protocolo/conexión.
 
     `tid`: hilo (hex de 16 cifras) cuyo PC actual se usa; `avoid`: direcciones con breakpoints ya conocidos por el llamador;
     `is_code(addr)`: opcional, ¿la dirección está en el código del programa?; `control`: exige que continuar sin breakpoint no pare;
-    `resume`: al terminar con limpieza correcta, reanuda el objetivo (si no, queda detenido como estaba al entrar)."""
-    state = {"installed": False, "addr": None}
-    try:
-        res = _run(g, tid, timeout, set(avoid), is_code, control, state)
-    except (GdbError, OSError, ValueError) as e:       # TimeoutError es OSError
-        res = Result(INCONCLUSIVE, "error de conexión o de protocolo: %s: %s" % (type(e).__name__, e), state["addr"])
-    cleanup_ok = _cleanup(g, state, res)
-    res.cleanup_ok = cleanup_ok
-    if resume and cleanup_ok and not g.running:
+    `resume`: al terminar con limpieza correcta, reanuda el objetivo (si no, queda detenido como estaba al entrar);
+    `attempts`: si un intento da «sin parada y el hilo sigue en el mismo PC» (parada silenciosa u hilo bloqueado: no es evidencia),
+    se avanza el hilo UNA instrucción con `s` (sin breakpoint puesto) y se repite en el PC nuevo, hasta `attempts` intentos en total.
+    Solo PASS o FAIL de un intento cuentan; los intentos previos quedan en `notes`. 1 desactiva los reintentos."""
+    earlier = []
+    n = 0
+    while True:
+        n += 1
+        state = {"installed": False, "addr": None}
+        try:
+            res = _run(g, tid, timeout, set(avoid), is_code, control, state)
+        except (GdbError, OSError, ValueError) as e:       # TimeoutError es OSError
+            res = Result(INCONCLUSIVE, "error de conexión o de protocolo: %s: %s" % (type(e).__name__, e), state["addr"])
+        res.cleanup_ok = _cleanup(g, state, res)
+        if not (res.retryable and res.cleanup_ok and n < attempts):
+            break
+        why = _advance(g, res.address, step_timeout)
+        if why:
+            res.notes.append("no se reintentó: " + why)
+            break
+        earlier.append("intento %d en 0x%x: %s" % (n, res.address, res.reason.split(":")[0]))
+    res.notes[:0] = earlier
+    if n > 1:
+        res.notes.append("%d intento(s) en total (el hilo avanzó una instrucción entre intentos)" % n)
+    if g.running:                   # p. ej. una interrupción fallida durante el avance
+        res.cleanup_ok = False
+    if resume and res.cleanup_ok:
         try:
             g.cont()
         except (GdbError, OSError) as e:
             res.notes.append("no se pudo reanudar: %s" % e)
     return res
+
+
+def _advance(g, pc, step_timeout):
+    """Un paso del hilo (sin breakpoint puesto). Devuelve None si avanzó, o el motivo por el que no se puede reintentar."""
+    try:
+        stop = g.step(step_timeout)
+    except TimeoutError:
+        try:
+            g.interrupt(timeout=CLEANUP_TIMEOUT)
+        except (GdbError, OSError) as e:
+            return "el paso no respondió en %gs y la interrupción falló (%s): el objetivo puede seguir en marcha" % (step_timeout, e)
+        return "el paso no respondió en %gs: hilo bloqueado" % step_timeout
+    except (GdbError, OSError) as e:
+        return "error en el paso: %s: %s" % (type(e).__name__, e)
+    if _stop_signal(stop) != 5:
+        return "paquete de parada inesperado tras el paso: %r" % stop
+    r = _regs(g)
+    if r is None or r["pc"] == pc:
+        return "el paso no movió el PC (0x%x)" % pc
+    return None
 
 
 def _run(g, tid, timeout, avoid, is_code, control, state):
@@ -145,7 +189,7 @@ def _after_timeout(g, tid, pc, timeout):
         return Result(INCONCLUSIVE, "sin parada en %gs; tras interrumpir, 'g' dio una respuesta inesperada" % timeout, pc)
     if r2["pc"] == pc:
         return Result(INCONCLUSIVE, "sin parada comunicada en %gs y el hilo sigue en 0x%x: parada silenciosa (el Z0 pudo funcionar sin avisar) "
-                                    "o hilo sin ejecutar; el plazo por sí solo no prueba nada" % (timeout, pc), pc)
+                                    "o hilo sin ejecutar; el plazo por sí solo no prueba nada" % (timeout, pc), pc, retryable=True)
     return Result(FAIL, "el hilo ejecutó la instrucción de 0x%x con Z0 puesto y siguió hasta 0x%x sin parar: los breakpoints no se respetan "
                         "(típico del decoder LLVM; con 'Interpreter (static)' debería parar)" % (pc, r2["pc"]), pc)
 
@@ -193,6 +237,7 @@ def build_parser():
     ap.add_argument("--elf", help="ELF: el PC debe caer en un segmento ejecutable")
     ap.add_argument("--code", help="rango de código lo-hi en hex (alternativa a --elf)")
     ap.add_argument("--timeout", type=float, default=5.0, help="s a esperar la parada (def. %(default)s)")
+    ap.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS, help="intentos en total; entre intentos el hilo avanza UNA instrucción (def. %(default)s; 1 = sin reintentos)")
     ap.add_argument("--no-control", action="store_true", help="omitir el control sin breakpoint")
     ap.add_argument("--no-resume", action="store_true", help="dejar el objetivo detenido al terminar")
     ap.add_argument("--port", type=int, default=2346)
@@ -210,7 +255,7 @@ def main(argv):
     ranges = validate_server.set_code_ranges(a.elf, a.code)
     g = Gdb("127.0.0.1", a.port, timeout=30.0)
     res = check_breakpoints(g, tid, a.timeout, is_code=validate_server.in_code if ranges else None,
-                            control=not a.no_control, resume=not a.no_resume)
+                            control=not a.no_control, resume=not a.no_resume, attempts=a.attempts)
     print(res.report())
     return EXIT_CODES[res.verdict]
 

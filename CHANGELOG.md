@@ -1,7 +1,7 @@
 # Cambios
 
 ## Sin publicar
-- `bp_preflight.py`: verificación previa de breakpoints (PASS / FAIL / INCONCLUSIVE) y 32 tests simulados. `bp_probe.py` no sondea sin PASS (`--preflight-timeout`, `--ignore-preflight`). `mock_rsp.py`: opciones de prueba opcionales (apagadas por defecto). Sin verificar contra RPCS3 real.
+- `bp_preflight.py`: verificación previa de breakpoints (PASS / FAIL / INCONCLUSIVE) y 41 tests simulados; reintento en otro PC (avanza una instrucción) cuando no hubo parada y el hilo no se movió (`--attempts`, `--preflight-attempts`). Corridas contra RPCS3 0.0.43 en `docs/bp_preflight.md`. `bp_probe.py` no sondea sin PASS (`--preflight-timeout`, `--ignore-preflight`). `mock_rsp.py`: opciones de prueba opcionales (apagadas por defecto). Probado con pocas corridas en RPCS3 real (intérprete y LLVM), no de forma exhaustiva.
 
 ## v0.1.0 (2026-10-27)
 - Proxy RSP persistente y servidor simulado (`proxy.py`, `mock_rsp.py`).

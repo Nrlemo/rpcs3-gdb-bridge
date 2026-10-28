@@ -130,6 +130,106 @@ class TestVeredictos(Base):
         self.g.interrupt(timeout=2.0)
 
 
+class TestReintento(Base):
+    """Un intento «sin parada y PC sin cambios» no es evidencia: se avanza UNA instrucción y se repite en otro PC."""
+
+    def steps(self):
+        return self.mock.seen.count("vCont;s")
+
+    def test_parada_silenciosa_y_el_siguiente_pc_da_pass(self):
+        self.mock.honor_bps, self.mock.step_advances = True, True
+        self.mock.silent_pcs = {PC}                          # el primer PC no avisa; el siguiente (PC+4) sí
+        r = self.check()
+        self.assertEqual((r.verdict, r.address), (pf.PASS, PC + 4), r.reason)
+        self.assertTrue(r.allows_probe)
+        self.assertEqual(self.steps(), 1)
+        self.assertTrue(any("intento 1 en 0x20010" in n for n in r.notes), r.notes)
+        self.assertIn("2 intento(s)", r.notes[-1])
+        self.assertClean()
+
+    def test_todos_los_intentos_silenciosos_siguen_inconclusos(self):
+        self.mock.honor_bps, self.mock.step_advances = True, True
+        self.mock.silent_pcs = {PC, PC + 4, PC + 8}
+        r = self.check(attempts=3)
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE, r.reason)
+        self.assertFalse(r.allows_probe)
+        self.assertEqual(self.steps(), 2)                    # 3 intentos = 2 pasos entre ellos
+        self.assertEqual(sum(1 for n in r.notes if n.startswith("intento")), 2)
+        self.assertClean()
+
+    def test_un_paso_que_no_mueve_el_pc_corta_los_reintentos(self):
+        self.mock.honor_bps = True                           # step_advances apagado: el paso no cambia el PC
+        self.mock.silent_pcs = {PC}
+        r = self.check()
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
+        self.assertEqual(self.steps(), 1)
+        self.assertTrue(any("no se reintentó" in n for n in r.notes), r.notes)
+        self.assertClean()
+
+    def test_attempts_1_desactiva_los_reintentos(self):
+        self.mock.honor_bps, self.mock.step_advances = True, True
+        self.mock.silent_pcs = {PC}
+        r = self.check(attempts=1)
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
+        self.assertEqual(self.steps(), 0)
+        self.assertClean()
+
+    def test_fail_y_rechazo_no_se_reintentan(self):
+        self.mock.reject_z0 = True
+        self.assertEqual(self.check().verdict, pf.FAIL)
+        self.assertEqual(self.steps(), 0)
+
+    def test_pc_avoid_en_el_segundo_intento_no_se_pisa(self):
+        self.mock.honor_bps, self.mock.step_advances = True, True
+        self.mock.silent_pcs = {PC}
+        r = self.check(avoid={PC + 4})
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
+        self.assertIn("no se pisa", r.reason)
+        self.assertNotIn("Z0,20014,4", self.mock.seen)
+        self.assertClean()
+
+
+class TestReintentoConDobles(unittest.TestCase):
+    def test_paso_sin_respuesta_es_hilo_bloqueado_y_se_interrumpe(self):
+        class G(ScriptedGdb):
+            def step(self, timeout=0):
+                self.calls.append("s")
+                self.running = True
+                raise TimeoutError()
+        g = G({"g": g_pkt(PC), "?": "S05"}, wait=TimeoutError())
+        r = pf.check_breakpoints(g, TID, 0.1)
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
+        self.assertTrue(r.cleanup_ok)
+        self.assertFalse(g.running)
+        self.assertTrue(any("bloqueado" in n for n in r.notes), r.notes)
+
+    def test_con_limpieza_fallida_no_se_avanza_ni_se_reintenta(self):
+        g = ScriptedGdb({"g": g_pkt(PC), "?": "S05"}, wait=TimeoutError(), rm="E01")     # el z0 no se confirma; sin método `step`
+        r = pf.check_breakpoints(g, TID, 0.1)                # si intentara avanzar, fallaría con AttributeError
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
+        self.assertFalse(r.cleanup_ok)
+        self.assertNotIn("s", g.calls)
+
+    def test_paso_con_interrupcion_fallida_marca_limpieza_sucia(self):
+        class G(ScriptedGdb):
+            def step(self, timeout=0):
+                self.running = True
+                raise TimeoutError()
+        g = G({"g": g_pkt(PC), "?": "S05"}, wait=TimeoutError())
+        calls = {"n": 0}
+        orig = g.interrupt
+
+        def interrupt(timeout=0):
+            calls["n"] += 1
+            if calls["n"] > 1:                              # la primera es la del plazo; la del paso falla
+                raise GdbError("muerto")
+            return orig(timeout)
+        g.interrupt = interrupt
+        r = pf.check_breakpoints(g, TID, 0.1)
+        self.assertFalse(r.cleanup_ok)
+        self.assertFalse(r.allows_probe)
+
+
 class TestEntradaYReplicas(Base):
     def test_objetivo_en_marcha_es_inconcluso_y_no_toca_nada(self):
         self.g.cont()
@@ -381,7 +481,8 @@ class TestBpProbeExigePass(Base):
 
     def test_opciones_nuevas_del_parser(self):
         a = bp_probe.build_parser().parse_args(["--elf", "e", "--sites", "s", "--out", "o"])
-        self.assertEqual((a.preflight_timeout, a.ignore_preflight), (5.0, False))
+        self.assertEqual((a.preflight_timeout, a.ignore_preflight, a.preflight_attempts), (5.0, False, 3))
+        self.assertEqual(pf.build_parser().parse_args(["--thread", "1"]).attempts, 3)
 
 
 if __name__ == "__main__":

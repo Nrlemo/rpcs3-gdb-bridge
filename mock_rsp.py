@@ -12,7 +12,8 @@ Reglas copiadas del código (no del comportamiento observado del emulador):
   * si el cliente cierra el socket el servidor queda `frozen` (como RPCS3: error fatal «Tried to read char»).
 Opciones de prueba (todas apagadas por defecto: el comportamiento base no cambia): `pc` (PC que devuelve `g`), `honor_bps` (un
 `vCont;c` con un `Z0` en `pc` para al instante), `advance_on_cont` (cada `vCont;c` avanza `pc` 4 y sigue corriendo: un `Z0` ignorado),
-`stop_always` (cada `vCont;c` para al instante, con o sin `Z0`), `reject_z0` (`Z0` responde vacío), `z0_reply` (respuesta fija a `Z0`).
+`stop_always` (cada `vCont;c` para al instante, con o sin `Z0`), `reject_z0` (`Z0` responde vacío), `z0_reply` (respuesta fija a `Z0`),
+`silent_pcs` (con `honor_bps`, un `Z0` en estos PC no para ni avisa: el hilo queda ahí), `step_advances` (cada `vCont;s` avanza `pc` 4).
 Memoria simulada: `BASE`..`BASE+SIZE`, byte i = i & 0xFF. `m` corta en la primera dirección inválida.
 Solo para pruebas: no escucha en el puerto 2345 salvo que se pida (por defecto puerto efímero).
 """
@@ -38,6 +39,7 @@ class MockRsp:
         self.swallowed, self.frozen, self.killed, self.paused = 0, False, False, False
         self.pc, self.honor_bps, self.advance_on_cont, self.stop_always = 0, False, False, False
         self.reject_z0, self.z0_reply = False, None
+        self.silent_pcs, self.step_advances = set(), False
         self.connected = threading.Event()
         self._trigger = threading.Event()
         self._end = False
@@ -182,9 +184,11 @@ class MockRsp:
                 if cmd.startswith("vCont;") and cmd[6:7] in ("c", "s") and len(cmd) == 7:
                     self.seen.append(cmd)
                     self.paused = False
+                    if cmd[6] == "s" and self.step_advances:
+                        self.pc += 4
                     if cmd[6] == "c":
                         self._trigger.clear()
-                        immediate = self.stop_always or (self.honor_bps and self.pc in self.bps)
+                        immediate = self.stop_always or (self.honor_bps and self.pc in self.bps and self.pc not in self.silent_pcs)
                         if self.advance_on_cont and not immediate:
                             self.pc += 4
                         while not immediate:

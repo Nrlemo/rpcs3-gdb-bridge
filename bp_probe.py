@@ -17,7 +17,7 @@ Uso (con el proxy en marcha y el juego corriendo; ver docs/bp_probe.md):
       [--thread-name GameThread] [--object-vtable 0x...] [--field-offset 0x...]
       [--route ruta.json --route-log <salida>/route.log] [--label-file etiqueta.txt] [--keep-after-route] [--watchdog 5]
       [--dump ra:0:0x80]... [--all-regs] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
-      [--preflight-timeout 5] [--ignore-preflight]
+      [--preflight-timeout 5] [--preflight-attempts 3] [--ignore-preflight]
 Antes de poner ningún `Z0` corre la verificación de bp_preflight.py (¿el servidor realmente para en un `Z0`?) y NO sigue salvo con PASS
 (código de salida 3 si no). `--ignore-preflight` la salta con un aviso y lo deja anotado en el JSONL; nunca se omite en silencio.
 `sitios.txt`: una línea por sitio, `0xVA [nombre]`; `#` comenta. La salida no debe existir. Si un sitio no es `stb`/`lbz`/`ld`
@@ -360,6 +360,7 @@ def build_parser():
     ap.add_argument("--cap-site", type=int, default=500)
     ap.add_argument("--port", type=int, default=2346)
     ap.add_argument("--preflight-timeout", type=float, default=5.0, help="s a esperar la parada de la verificación previa (def. %(default)g)")
+    ap.add_argument("--preflight-attempts", type=int, default=bp_preflight.DEFAULT_ATTEMPTS, help="intentos de la verificación previa (entre intentos el hilo avanza una instrucción; def. %(default)d)")
     ap.add_argument("--ignore-preflight", action="store_true", help="seguir aunque la verificación previa no dé PASS (aviso + anotado en la salida); no cubre una limpieza fallida")
     return ap
 
@@ -380,7 +381,8 @@ def main(argv):
     tid = a.thread.zfill(16) if a.thread else find_game_thread(a.log, a.thread_name)
     label = RouteLabel(a.route, a.route_log) if a.route and a.route_log else (FileLabel(a.label_file) if a.label_file else None)
     g = Gdb("127.0.0.1", a.port, timeout=30.0)
-    pre = bp_preflight.check_breakpoints(g, tid, a.preflight_timeout, avoid=sites, is_code=img.in_code)
+    pre = bp_preflight.check_breakpoints(g, tid, a.preflight_timeout, avoid=sites, is_code=img.in_code,
+                                        attempts=a.preflight_attempts)
     print(pre.report(), file=sys.stderr)
     if not pre.cleanup_ok:
         print("error: la verificación previa dejó el estado sucio; no se continúa (ni con --ignore-preflight)", file=sys.stderr)
