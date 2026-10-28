@@ -115,3 +115,32 @@ Con el intérprete, 8 rondas: se lee con `m` la memoria alrededor del PC antes d
   (c) no explica el FAIL de primer intento fuera de `sc` (n=1) ni los 2 posteriores al paso retirado, pero esas muestras son demasiado pequeñas para descartarla.
 - **Desconocido:** la causa; si algún ajuste de RPCS3 hace que LLVM respete los breakpoints; qué ocurre con otros hilos, pantallas o versiones. **No se afirma que LLVM carezca de breakpoints en general.**
 - Los 2 INCONCLUSIVE del intérprete por PC sin cambios caen en `sc`: compatible con un hilo bloqueado dentro de la llamada (hipótesis, no demostrado).
+
+## Tanda 8 (2026-10-28): contexto de instrucción en cada intento
+**Código:** `f81dcf1` (campos `instruccion`, `desenlace`, `decoder_ppu` en cada intento; solo observacionales, ver `docs/bp_preflight.md`). **Método:** un arranque por decoder, `bp_preflight.py --elf <ELF original> --log … --timeout 8 --attempts 3 --json`,
+corridas seguidas entre `t+17 s` y `t+166 s` desde que apareció `GameThread`; sin forzar reintentos ni manipular el juego. El bridge tomó `decoder_ppu` de la línea `PPU Decoder:` del log (fuente registrada en el JSON).
+**Contexto:** la película de apertura en ambas muestras, pero **no el mismo fotograma** (escenas distintas, capturas cada ~10 s sin sincronizar con las corridas).
+
+| Muestra | Corridas | Resultado |
+|---|---|---|
+| Intérprete (`Interpreter (static)`) | 33 | 28 PASS; 5 INCONCLUSIVE por PC fuera del código del ELF (sin `Z0`); 0 reintentos; limpieza correcta |
+| LLVM (`Recompiler (LLVM)`) | 13 | 13 FAIL (`desenlace: avanzo`); 0 reintentos; limpieza correcta |
+
+En el intérprete, 23 de los 28 PASS fueron en un `sc` y 5 en otras instrucciones; en LLVM, 9 de los 13 FAIL fueron en un `sc` y 4 en otras (`li`, `b`). Hubo PC que no son `sc` probados con ambos decoders (PASS con el intérprete, FAIL con LLVM).
+
+### Asociación con `sc` (todas las tandas, primer intento)
+| Decoder | Instrucción en el PC | PASS | FAIL | INCONCLUSIVE por PC sin cambios |
+|---|---|---|---|---|
+| Intérprete | `sc` | 107 | 0 | 2 |
+| Intérprete | otra (31 con mnemónico o palabra no reconocida) | 31 | 0 | 0 |
+| LLVM | `sc` | 0 | 19 | 2 |
+| LLVM | otra | 0 | 5 | 0 |
+
+Aparte, en el intérprete, 9 corridas con el PC fuera del código del ELF (INCONCLUSIVE, sin `Z0`). Se excluyen los 2 FAIL de LLVM obtenidos tras el paso con `s` (reintento retirado). Las tandas 1–7 se decodificaron **a posteriori**
+con un script fuera del bridge; la tanda 8 usa los campos nuevos de `bp_preflight.py`. Todos los INCONCLUSIVE por PC sin cambios (4 de 4) caen en `sc`; en los PC que no son `sc` hubo 0 de 36. Las corridas repiten pocos PC distintos y no son independientes: son
+**conteos descriptivos, no una prueba de asociación**.
+
+- **FAIL con LLVM no depende de `sc`:** 5 de 5 primeros intentos fuera de `sc` dieron FAIL, igual que 19 de 19 decisivos en `sc`; con el intérprete los mismos tipos de instrucción dan PASS. La hipótesis (c) por sí sola no explica los FAIL de LLVM.
+- **«PC sin cambios» coincide con `sc`** (4 de 4; 0 de 36 fuera de `sc`): compatible con un hilo bloqueado dentro de la llamada o con una parada silenciosa, no distinguibles aquí. Correlación en una muestra mínima.
+- **No se estableció la causa.** Siguen abiertas: rechazo del `Z0` con LLVM, un código LLVM que no consulta la tabla de breakpoints, el estado del juego y el significado exacto del PC en LLVM.
+- **Límites:** un hilo, un contexto (la apertura), un arranque por decoder, escenas no alineadas, palabra de instrucción tomada del ELF, mnemónicos solo para unas pocas codificaciones. Evidencia con direcciones: repo del proyecto que consume el bridge.

@@ -1,7 +1,7 @@
 # Cambios
 
 ## Sin publicar
-- `bp_preflight.py`: verificación previa de breakpoints (PASS / FAIL / INCONCLUSIVE) con reintento acotado en otra dirección de retorno validada contra el ELF (sin `s`, sin cambiar de hilo; un reintento solo da PASS o INCONCLUSIVE) y registro por intento. `bp_probe.py` no sondea sin PASS (`--preflight-timeout`, `--preflight-attempts`, `--ignore-preflight`) y copia los intentos al evento `inicio`. `mock_rsp.py`: opciones de prueba opcionales (apagadas por defecto). 55 tests simulados; `--json` (resultado con un registro por intento); la limpieza del `Z0` y la parada del objetivo también ante Ctrl-C; informe de corridas reales en `docs/evidencia/preflight_rpcs3_0.0.43/` (muestra chica; el reintento actual sin probar contra RPCS3 real).
+- `bp_preflight.py`: verificación previa de breakpoints (PASS / FAIL / INCONCLUSIVE) con reintento acotado en otra dirección de retorno validada contra el ELF (sin `s`, sin cambiar de hilo; un reintento solo da PASS o INCONCLUSIVE) y registro por intento. `bp_probe.py` no sondea sin PASS (`--preflight-timeout`, `--preflight-attempts`, `--ignore-preflight`) y copia los intentos al evento `inicio`. `mock_rsp.py`: opciones de prueba opcionales (apagadas por defecto). 73 tests simulados; contexto de instrucción por intento (`instruccion`, `desenlace`, `decoder_ppu`, `--ppu-decoder`; solo observacional); `--json` (resultado con un registro por intento); la limpieza del `Z0` y la parada del objetivo también ante Ctrl-C; informe de corridas reales en `docs/evidencia/preflight_rpcs3_0.0.43/` (muestra chica; el reintento actual sin probar contra RPCS3 real).
 
 ## v0.1.0 (2026-10-27)
 - Proxy RSP persistente y servidor simulado (`proxy.py`, `mock_rsp.py`).
