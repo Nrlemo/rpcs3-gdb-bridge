@@ -79,3 +79,11 @@ Cada registro de intento (`Result.attempts`, `--json`, evento `inicio` de `bp_pr
 
 ## `bp_probe.py`
 Ejecuta esta verificación antes de abrir la salida o poner un `Z0`, con `avoid` = sus sitios, `is_code` = el código del ELF y `alternates` = `make_alternates(img)`. Sin PASS (y limpieza correcta) imprime el informe, **no crea el archivo de salida**, deja el juego en marcha y termina con código 3. `--preflight-timeout N` (por intento) y `--preflight-attempts N` ajustan el plazo y el máximo de intentos. `--ignore-preflight` es el único modo de seguir sin PASS: imprime un aviso, anota el veredicto, los intentos y `"ignorado": true` en el evento `inicio` del JSONL, y **no cubre** una limpieza fallida (con un `Z0` posiblemente puesto, se niega siempre).
+
+## Decisión de uso y condiciones para retomar (2026-10-28)
+- **Decoder:** se mantiene `Interpreter (static)` para el trabajo actual. Con él la verificación dio PASS en las corridas reales decisivas; con LLVM dio FAIL (o INCONCLUSIVE) y no se estableció por qué (ver el informe de evidencia, tandas 7 y 8).
+- **Qué se conserva:** `bp_preflight.py`, `bp_probe.py` (protegido por la verificación), `mock_rsp.py`, los 150 tests y las evidencias, como herramientas de investigación. Nada se borra.
+- **Qué no se hace por ahora:** seguir investigando LLVM, añadir estrategias de reintento, pasos automáticos ni cambios de hilo.
+- **Cuándo retomar (las dos condiciones a la vez):** (1) una lectura del código fuente de RPCS3 identifica un defecto concreto; y (2) LLVM aporta una ventaja real para el flujo de trabajo.
+- **Si se retoma:** primero leer el código fuente de RPCS3 (`ppu_breakpoint` y el sitio donde cada decoder comprueba los breakpoints, en el commit estudiado `6110dbb2`) **antes** de decidir cualquier modificación. No se hace fork, parche ni compilación sin esa lectura.
+- **Estado del conocimiento:** la causa de la diferencia entre decoders sigue sin establecerse; las hipótesis abiertas están en el informe de evidencia.

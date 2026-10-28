@@ -30,6 +30,12 @@ Python puro (solo biblioteca estándar). English summary: [README.en.md](README.
 ## Verificación previa de breakpoints
 Un `Z0` aceptado **no prueba que el breakpoint funcione**: el servidor de RPCS3 contesta `OK` siempre (con el decoder LLVM nunca para). `bp_preflight.py` pone un `Z0` en el PC actual del hilo, continúa y comprueba que hay una parada real en ese PC (y que continuar sin `Z0` no para). **PASS**: los breakpoints de ejecución funcionan en ese hilo ahora. **FAIL**: `Z0` rechazado, o el hilo ejecutó la instrucción protegida sin parar (típico de LLVM). **INCONCLUSIVE**: no se pudo decidir con seguridad (un plazo vencido por sí solo nunca es FAIL). Si el hilo no se movió y no hubo parada, `--attempts` (3 por defecto, 1 = sin reintentos) prueba otra dirección de retorno del hilo validada contra el ELF (nunca avanza el hilo ni cambia de hilo; un reintento solo puede dar PASS o INCONCLUSIVE). Con `Interpreter (static)` se espera PASS; con LLVM, FAIL. Límites que solo RPCS3 podría resolver (listar breakpoints ajenos, paradas silenciosas, un solo hilo): `docs/bp_preflight.md`. Corridas contra RPCS3 real (muestra chica, sin estadística; el reintento actual aún sin probar allí): `docs/evidencia/preflight_rpcs3_0.0.43/README.md`. `bp_probe.py` la ejecuta antes de tocar nada; `--ignore-preflight` la salta con aviso.
 
+## Estado y decisión de uso
+**Decisión de uso (2026-10-28):** para el trabajo actual se mantiene `PPU Decoder: Interpreter (static)`, el único con el que un `Z0` se observó parar. El bridge, sus pruebas y las evidencias se conservan como **herramientas de investigación**, sin seguir
+investigando LLVM por ahora. El proyecto solo se retoma si se cumplen **las dos** condiciones: (1) una lectura del código fuente de RPCS3 identifica un defecto concreto, y (2) LLVM aporta una ventaja real para el flujo de trabajo. En ese caso, antes de decidir cualquier
+modificación de RPCS3 hay que leer su código fuente (en particular `ppu_breakpoint` y el sitio donde cada decoder comprueba los breakpoints, commit `6110dbb2`); no se hace fork ni se compila sin esa lectura. La causa de la diferencia con LLVM **sigue sin establecerse**
+(`docs/evidencia/preflight_rpcs3_0.0.43/README.md`).
+
 ## Pruebas
 ```
 python3 -I tests/run_all.py --min-tests 100
