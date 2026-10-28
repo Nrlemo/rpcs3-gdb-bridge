@@ -1,5 +1,8 @@
 # Cambios
 
+## Sin publicar
+- `bp_preflight.py`: verificación previa de breakpoints (PASS / FAIL / INCONCLUSIVE) y 32 tests simulados. `bp_probe.py` no sondea sin PASS (`--preflight-timeout`, `--ignore-preflight`). `mock_rsp.py`: opciones de prueba opcionales (apagadas por defecto). Sin verificar contra RPCS3 real.
+
 ## v0.1.0 (2026-10-27)
 - Proxy RSP persistente y servidor simulado (`proxy.py`, `mock_rsp.py`).
 - Cliente RSP (`gdbrsp.py`) y sesión persistente (`dbg_session.py`).

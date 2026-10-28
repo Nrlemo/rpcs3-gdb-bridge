@@ -17,6 +17,9 @@ Uso (con el proxy en marcha y el juego corriendo; ver docs/bp_probe.md):
       [--thread-name GameThread] [--object-vtable 0x...] [--field-offset 0x...]
       [--route ruta.json --route-log <salida>/route.log] [--label-file etiqueta.txt] [--keep-after-route] [--watchdog 5]
       [--dump ra:0:0x80]... [--all-regs] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
+      [--preflight-timeout 5] [--ignore-preflight]
+Antes de poner ningún `Z0` corre la verificación de bp_preflight.py (¿el servidor realmente para en un `Z0`?) y NO sigue salvo con PASS
+(código de salida 3 si no). `--ignore-preflight` la salta con un aviso y lo deja anotado en el JSONL; nunca se omite en silencio.
 `sitios.txt`: una línea por sitio, `0xVA [nombre]`; `#` comenta. La salida no debe existir. Si un sitio no es `stb`/`lbz`/`ld`
 (o, con `--field-offset`, un `stb`/`lbz` con otro desplazamiento), aborta. No cierra la conexión del proxy; al terminar quita sus `Z0`
 y deja el juego corriendo.
@@ -36,6 +39,7 @@ sys.path.insert(0, HERE)
 from gdbrsp import Gdb  # noqa: E402
 from validate_server import parse_g  # noqa: E402
 import opd_scan  # noqa: E402
+import bp_preflight  # noqa: E402
 
 DEFAULT_THREAD_NAME = "GameThread"      # nombre del hilo principal en el log de RPCS3
 BL_LIKE = (0x4E800421, 0x4E800021)      # bctrl, blrl
@@ -355,6 +359,8 @@ def build_parser():
     ap.add_argument("--cap-key", type=int, default=10)
     ap.add_argument("--cap-site", type=int, default=500)
     ap.add_argument("--port", type=int, default=2346)
+    ap.add_argument("--preflight-timeout", type=float, default=5.0, help="s a esperar la parada de la verificación previa (def. %(default)g)")
+    ap.add_argument("--ignore-preflight", action="store_true", help="seguir aunque la verificación previa no dé PASS (aviso + anotado en la salida); no cubre una limpieza fallida")
     return ap
 
 
@@ -374,11 +380,23 @@ def main(argv):
     tid = a.thread.zfill(16) if a.thread else find_game_thread(a.log, a.thread_name)
     label = RouteLabel(a.route, a.route_log) if a.route and a.route_log else (FileLabel(a.label_file) if a.label_file else None)
     g = Gdb("127.0.0.1", a.port, timeout=30.0)
+    pre = bp_preflight.check_breakpoints(g, tid, a.preflight_timeout, avoid=sites, is_code=img.in_code)
+    print(pre.report(), file=sys.stderr)
+    if not pre.cleanup_ok:
+        print("error: la verificación previa dejó el estado sucio; no se continúa (ni con --ignore-preflight)", file=sys.stderr)
+        return 3
+    if not pre.allows_probe:
+        if not a.ignore_preflight:
+            print("error: sin PASS en la verificación previa no se sondea con Z0 (--ignore-preflight lo salta bajo su responsabilidad)", file=sys.stderr)
+            g.cont()        # el estado normal de esta herramienta es dejar el juego corriendo
+            return 3
+        print("AVISO: --ignore-preflight: se sigue con la verificación en %s" % pre.verdict, file=sys.stderr)
     g.cmd("Hg" + tid)
     g.cmd("Hc" + tid)
     with open(a.out, "x", encoding="utf-8") as out:
         p = Probe(g, img, sites, tid, out, label, a.cap_key, a.cap_site, parse_dumps(a.dump), a.all_regs, a.object_vtable)
-        p.emit({"evento": "inicio", "hilo": tid, "sitios": {hex(v): d for v, d in sites.items()}, "cap_key": a.cap_key, "cap_site": a.cap_site})
+        p.emit({"evento": "inicio", "preflight": {"veredicto": pre.verdict, "motivo": pre.reason, "ignorado": bool(a.ignore_preflight and not pre.allows_probe)},
+                "hilo": tid, "sitios": {hex(v): d for v, d in sites.items()}, "cap_key": a.cap_key, "cap_site": a.cap_site})
         for va in sites:
             if not g.bp(va):
                 p.emit({"evento": "error", "detalle": "Z0 rechazado en 0x%x" % va})

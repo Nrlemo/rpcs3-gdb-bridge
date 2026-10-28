@@ -10,6 +10,9 @@ Reglas copiadas del código (no del comportamiento observado del emulador):
   * `vCont;c` espera leyendo byte a byte: solo `0x03` (o un `trigger_stop()` de la prueba) lo detiene; los
     demás bytes se tragan (`swallowed`);
   * si el cliente cierra el socket el servidor queda `frozen` (como RPCS3: error fatal «Tried to read char»).
+Opciones de prueba (todas apagadas por defecto: el comportamiento base no cambia): `pc` (PC que devuelve `g`), `honor_bps` (un
+`vCont;c` con un `Z0` en `pc` para al instante), `advance_on_cont` (cada `vCont;c` avanza `pc` 4 y sigue corriendo: un `Z0` ignorado),
+`stop_always` (cada `vCont;c` para al instante, con o sin `Z0`), `reject_z0` (`Z0` responde vacío), `z0_reply` (respuesta fija a `Z0`).
 Memoria simulada: `BASE`..`BASE+SIZE`, byte i = i & 0xFF. `m` corta en la primera dirección inválida.
 Solo para pruebas: no escucha en el puerto 2345 salvo que se pida (por defecto puerto efímero).
 """
@@ -33,6 +36,8 @@ class MockRsp:
         self.port = self.ls.getsockname()[1]
         self.seen, self.protocol_errors, self.bps = [], [], set()
         self.swallowed, self.frozen, self.killed, self.paused = 0, False, False, False
+        self.pc, self.honor_bps, self.advance_on_cont, self.stop_always = 0, False, False, False
+        self.reject_z0, self.z0_reply = False, None
         self.connected = threading.Event()
         self._trigger = threading.Event()
         self._end = False
@@ -137,7 +142,7 @@ class MockRsp:
             r = self._mem(int(a, 16), int(n, 16))
             return r if r or int(n, 16) == 0 else "E01"
         if cmd == "g":
-            return "00" * 556
+            return "0" * 1024 + "%016x" % self.pc + "0" * (1112 - 1040)
         if cmd.startswith("p"):
             return "%016x" % (0x1234 + int(cmd[1:], 16))
         if cmd.startswith("H"):
@@ -146,6 +151,8 @@ class MockRsp:
             return "QC0000000000000001"
         if cmd == "qAttached":
             return "1"
+        if cmd.startswith("Z0,") and (self.reject_z0 or self.z0_reply is not None):
+            return "" if self.reject_z0 else self.z0_reply
         if cmd.startswith("Z0,"):
             self.bps.add(int(cmd.split(",")[1], 16)); return "OK"
         if cmd.startswith("z0,"):
@@ -177,7 +184,10 @@ class MockRsp:
                     self.paused = False
                     if cmd[6] == "c":
                         self._trigger.clear()
-                        while True:
+                        immediate = self.stop_always or (self.honor_bps and self.pc in self.bps)
+                        if self.advance_on_cont and not immediate:
+                            self.pc += 4
+                        while not immediate:
                             if self._trigger.is_set():
                                 break
                             c = self._read()

@@ -5,12 +5,15 @@ Sirve para responder «¿quién escribe/lee este campo en cada pantalla?» sin r
 
 **Requisitos:** `PPU Decoder: Interpreter (static)` (con LLVM el servidor acepta `Z0` y nunca para, ver `servidor_gdb_rpcs3.md`), el proxy en marcha, el ELF del programa (descifrado) y un archivo de sitios.
 
+## Verificación previa
+Antes de poner ningún `Z0` ejecuta `bp_preflight.py` (`docs/bp_preflight.md`) y **no sondea salvo con PASS** (código de salida 3 y sin archivo de salida en otro caso). `--preflight-timeout N`; `--ignore-preflight` la salta con aviso y lo anota en el evento `inicio` (no cubre una limpieza fallida).
+
 ## Uso
 ```
 python3 -I bp_probe.py --elf programa.elf --sites sitios.txt --out salida.jsonl [--log RPCS3.log | --thread <id_hex>]
     [--thread-name GameThread] [--object-vtable 0x...] [--field-offset 0x...]
     [--route ruta.json --route-log <dir>/route.log | --label-file etiqueta.txt] [--keep-after-route]
-    [--watchdog 5] [--dump ra:0:0x80]... [--all-regs] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
+    [--watchdog 5] [--preflight-timeout 5] [--ignore-preflight] [--dump ra:0:0x80]... [--all-regs] [--duration 600] [--max-bps 8] [--cap-key 10] [--cap-site 500] [--port 2346]
 ```
 - **Sitios** (`examples/sitios.ejemplo.txt`): una línea `0xVA [nombre]`. Se decodifican del propio ELF: `stb rS,D(rA)` (valor = byte bajo de `rS`, que aún no se ejecutó), `lbz rD,D(rA)` (valor = byte actual en `rA+D`, leído por `m`) o `ld rD,DS(rA)` (valor = la palabra de 8 B que se va a cargar). Si la instrucción no es de esas, **aborta**. `--field-offset` valida (opcional) que los `stb`/`lbz` usen ese desplazamiento.
 - **Objeto buscado** (`--object-vtable`): si se da, solo «coinciden» los impactos con `*(u32*)rA == valor`; así el filtro no depende de direcciones fijas (que podrían cambiar entre arranques). Sin él, todo impacto coincide y no se lee el objeto.
@@ -35,4 +38,4 @@ Eventos `inicio`, impactos (`site`, `kind`, `lr`, `obj`, `match`, `vtable`, `val
 Medido (n=4, intérprete): ≈ 0,5 s por impacto. Sirve para sitios **raros** (escrituras por widget, constantes). Para lecturas calientes (cada fotograma/glifo) conviene inyectar una cueva de código que anote en un anillo de memoria (no hay latencia de red), a costa de modificar el programa.
 
 ## Tests y límites
-24 tests sintéticos (`tests/test_bp_probe.py`), incluido el bucle completo contra un servidor simulado que nunca avisa de la parada (con y sin vigía) y dos mutaciones que los hacen fallar. **No probado:** otras versiones de RPCS3; el techo de `Z0` simultáneos (8 se aceptaron); qué pasa si el `Z0` lo alcanza un hilo distinto del seleccionado más allá de la búsqueda entre hilos.
+24 tests sintéticos (más los de la verificación previa en `tests/test_bp_preflight.py`) (`tests/test_bp_probe.py`), incluido el bucle completo contra un servidor simulado que nunca avisa de la parada (con y sin vigía) y dos mutaciones que los hacen fallar. **No probado:** otras versiones de RPCS3; el techo de `Z0` simultáneos (8 se aceptaron); qué pasa si el `Z0` lo alcanza un hilo distinto del seleccionado más allá de la búsqueda entre hilos.
