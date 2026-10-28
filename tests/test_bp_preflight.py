@@ -20,6 +20,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import bp_preflight as pf  # noqa: E402
 import bp_probe  # noqa: E402
+import bp_probe as bp  # noqa: E402
 import mock_rsp  # noqa: E402
 import proxy  # noqa: E402
 import opd_scan  # noqa: E402
@@ -130,104 +131,153 @@ class TestVeredictos(Base):
         self.g.interrupt(timeout=2.0)
 
 
+ALT_A, ALT_B, ALT_C = 0x30000, 0x30010, 0x30020
+
+
+def alts(*addrs):
+    """`alternates` de prueba: las direcciones ya «validadas» por quien llama."""
+    return lambda regs, read: [(a, "retorno_%d" % i) for i, a in enumerate(addrs, 1)]
+
+
 class TestReintento(Base):
-    """Un intento «sin parada y PC sin cambios» no es evidencia: se avanza UNA instrucción y se repite en otro PC."""
+    """Servidor simulado. Un intento «plazo vencido con el PC sin cambios» no es evidencia: se prueba OTRA dirección validada,
+    con el ciclo completo. Nunca se avanza el hilo con `s`, ni se cambia de hilo, ni se suma al PC."""
 
-    def steps(self):
-        return self.mock.seen.count("vCont;s")
+    def setUp(self):
+        super().setUp()
+        self.mock.honor_bps = True
+        self.mock.silent_pcs = {PC}                          # el primer intento: Z0 aceptado, sin parada y el PC no se mueve
 
-    def test_parada_silenciosa_y_el_siguiente_pc_da_pass(self):
-        self.mock.honor_bps, self.mock.step_advances = True, True
-        self.mock.silent_pcs = {PC}                          # el primer PC no avisa; el siguiente (PC+4) sí
-        r = self.check()
-        self.assertEqual((r.verdict, r.address), (pf.PASS, PC + 4), r.reason)
+    def assertSinPasos(self):
+        self.assertNotIn("vCont;s", self.mock.seen)
+        self.assertEqual({c for c in self.mock.seen if c.startswith("Hg")}, {"Hg" + TID})   # un solo hilo
+
+    def test_inconcluso_y_luego_pass_genuino(self):
+        self.mock.reach = {ALT_A}
+        r = self.check(alternates=alts(ALT_A, ALT_B))
+        self.assertEqual((r.verdict, r.address), (pf.PASS, ALT_A), r.reason)
         self.assertTrue(r.allows_probe)
-        self.assertEqual(self.steps(), 1)
-        self.assertTrue(any("intento 1 en 0x20010" in n for n in r.notes), r.notes)
-        self.assertIn("2 intento(s)", r.notes[-1])
+        self.assertEqual([(a["n"], a["veredicto"], a["pc"]) for a in r.attempts],
+                         [(1, pf.INCONCLUSIVE, hex(PC)), (2, pf.PASS, hex(ALT_A))])
+        self.assertEqual(r.attempts[1]["origen"], "retorno_1")
+        self.assertEqual(r.attempts[1]["pc_tras_parada"], hex(ALT_A))
+        self.assertEqual(self.mock.seen.count("vCont;c"), 3)   # intento 1 (plazo) + intento 2 (prueba) + su control
+        self.assertTrue(r.attempts[1]["control"].startswith("sin parada"))
+        self.assertTrue(any("PASS en el intento 2" in n for n in r.notes), r.notes)
+        self.assertSinPasos()
         self.assertClean()
 
-    def test_todos_los_intentos_silenciosos_siguen_inconclusos(self):
-        self.mock.honor_bps, self.mock.step_advances = True, True
-        self.mock.silent_pcs = {PC, PC + 4, PC + 8}
-        r = self.check(attempts=3)
+    def test_inconcluso_repetido_llega_al_limite(self):
+        r = self.check(alternates=alts(ALT_A, ALT_B, ALT_C), attempts=3)       # ninguna se alcanza
         self.assertEqual(r.verdict, pf.INCONCLUSIVE, r.reason)
         self.assertFalse(r.allows_probe)
-        self.assertEqual(self.steps(), 2)                    # 3 intentos = 2 pasos entre ellos
-        self.assertEqual(sum(1 for n in r.notes if n.startswith("intento")), 2)
+        self.assertEqual(len(r.attempts), 3)
+        self.assertEqual([a["pc"] for a in r.attempts], [hex(PC), hex(ALT_A), hex(ALT_B)])   # ALT_C no se usa
+        self.assertTrue(any("límite de 3 intentos" in n for n in r.notes), r.notes)
+        self.assertSinPasos()
+        self.assertClean()                                  # cada Z0 se quitó
+
+    def test_fail_por_avance_no_se_reintenta(self):
+        self.mock.honor_bps, self.mock.silent_pcs = False, set()
+        self.mock.advance_on_cont = True                    # Z0 ignorado: el hilo ejecuta la instrucción y sigue
+
+        def boom(regs, read):
+            raise AssertionError("no debía buscar alternativas")
+        r = self.check(alternates=boom)
+        self.assertEqual((r.verdict, len(r.attempts)), (pf.FAIL, 1))
         self.assertClean()
 
-    def test_un_paso_que_no_mueve_el_pc_corta_los_reintentos(self):
-        self.mock.honor_bps = True                           # step_advances apagado: el paso no cambia el PC
-        self.mock.silent_pcs = {PC}
-        r = self.check()
+    def test_intento_alternativo_nunca_da_fail(self):
+        calls = []
+
+        def alternates(regs, read):
+            calls.append(1)
+            return [(ALT_A, "retorno_1")]
+        # primer intento inconcluso; en el segundo el hilo se mueve sin parar: INCONCLUSIVE, no FAIL
+        self.mock.advance_on_cont = False
+        orig = self.mock._handle
+
+        def handle(cmd):
+            if cmd.startswith("Z0,%x" % ALT_A):
+                self.mock.pc = PC + 0x40                    # el hilo ya no está donde empezó
+            return orig(cmd)
+        self.mock._handle = handle
+        r = self.check(alternates=alternates, attempts=2)
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE, r.reason)
+        self.assertEqual(len(r.attempts), 2)
+        self.assertIn("no prueba que el hilo pasara", r.attempts[1]["motivo"])
+        self.assertEqual(calls, [1])
+        self.assertClean()
+
+    def test_fail_por_rechazo_no_se_reintenta(self):
+        self.mock.reject_z0 = True
+
+        def boom(regs, read):
+            raise AssertionError("no debía buscar alternativas")
+        r = self.check(alternates=boom)
+        self.assertEqual((r.verdict, len(r.attempts)), (pf.FAIL, 1))
+        self.assertClean()
+
+    def test_sin_alternates_no_hay_direccion_segura(self):
+        r = self.check(alternates=None)
+        self.assertEqual((r.verdict, len(r.attempts)), (pf.INCONCLUSIVE, 1))
+        self.assertTrue(any("se necesita --elf" in n for n in r.notes), r.notes)
+        self.assertClean()
+
+    def test_ninguna_alternativa_valida(self):
+        # misma dirección, desalineada, con breakpoint conocido y fuera del código: todas descartadas
+        bad = alts(PC, ALT_A + 2, ALT_B, ALT_C)
+        r = self.check(alternates=bad, avoid={ALT_B}, is_code=lambda a: a != ALT_C)
+        self.assertEqual((r.verdict, len(r.attempts)), (pf.INCONCLUSIVE, 1))
+        self.assertTrue(any("no hay otra dirección alternativa válida" in n for n in r.notes), r.notes)
+        self.assertFalse(any(c.startswith("Z0,3") for c in self.mock.seen))
+        self.assertClean()
+
+    def test_alternates_que_falla_deja_inconcluso(self):
+        def boom(regs, read):
+            raise ValueError("cadena corrupta")
+        r = self.check(alternates=boom)
         self.assertEqual(r.verdict, pf.INCONCLUSIVE)
-        self.assertEqual(self.steps(), 1)
-        self.assertTrue(any("no se reintentó" in n for n in r.notes), r.notes)
+        self.assertTrue(any("error al buscar" in n for n in r.notes), r.notes)
         self.assertClean()
 
     def test_attempts_1_desactiva_los_reintentos(self):
-        self.mock.honor_bps, self.mock.step_advances = True, True
-        self.mock.silent_pcs = {PC}
-        r = self.check(attempts=1)
-        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
-        self.assertEqual(self.steps(), 0)
+        def boom(regs, read):
+            raise AssertionError("no debía buscar alternativas")
+        r = self.check(alternates=boom, attempts=1)
+        self.assertEqual((r.verdict, len(r.attempts)), (pf.INCONCLUSIVE, 1))
         self.assertClean()
 
-    def test_fail_y_rechazo_no_se_reintentan(self):
-        self.mock.reject_z0 = True
-        self.assertEqual(self.check().verdict, pf.FAIL)
-        self.assertEqual(self.steps(), 0)
+    def test_parada_ajena_en_la_alternativa_es_inconclusa(self):
+        self.mock.reach = {ALT_A}
+        orig = self.mock._handle
+        self.mock.stop_always = False
 
-    def test_pc_avoid_en_el_segundo_intento_no_se_pisa(self):
-        self.mock.honor_bps, self.mock.step_advances = True, True
-        self.mock.silent_pcs = {PC}
-        r = self.check(avoid={PC + 4})
+        # el servidor para en otro PC al alcanzar la alternativa
+        def handle(cmd):
+            if cmd == "g" and self.mock.pc == ALT_A:
+                self.mock.pc = ALT_A + 0x100
+            return orig(cmd)
+        self.mock._handle = handle
+        r = self.check(alternates=alts(ALT_A, ALT_B), attempts=2)
         self.assertEqual(r.verdict, pf.INCONCLUSIVE)
-        self.assertIn("no se pisa", r.reason)
-        self.assertNotIn("Z0,20014,4", self.mock.seen)
+        self.assertIn("ajena", r.reason)
         self.assertClean()
 
+    def test_rechazo_de_z0_en_la_alternativa_es_inconcluso_no_fail(self):
+        orig = self.mock._handle
 
-class TestReintentoConDobles(unittest.TestCase):
-    def test_paso_sin_respuesta_es_hilo_bloqueado_y_se_interrumpe(self):
-        class G(ScriptedGdb):
-            def step(self, timeout=0):
-                self.calls.append("s")
-                self.running = True
-                raise TimeoutError()
-        g = G({"g": g_pkt(PC), "?": "S05"}, wait=TimeoutError())
-        r = pf.check_breakpoints(g, TID, 0.1)
-        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
-        self.assertTrue(r.cleanup_ok)
-        self.assertFalse(g.running)
-        self.assertTrue(any("bloqueado" in n for n in r.notes), r.notes)
-
-    def test_con_limpieza_fallida_no_se_avanza_ni_se_reintenta(self):
-        g = ScriptedGdb({"g": g_pkt(PC), "?": "S05"}, wait=TimeoutError(), rm="E01")     # el z0 no se confirma; sin método `step`
-        r = pf.check_breakpoints(g, TID, 0.1)                # si intentara avanzar, fallaría con AttributeError
-        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
-        self.assertFalse(r.cleanup_ok)
-        self.assertNotIn("s", g.calls)
-
-    def test_paso_con_interrupcion_fallida_marca_limpieza_sucia(self):
-        class G(ScriptedGdb):
-            def step(self, timeout=0):
-                self.running = True
-                raise TimeoutError()
-        g = G({"g": g_pkt(PC), "?": "S05"}, wait=TimeoutError())
-        calls = {"n": 0}
-        orig = g.interrupt
-
-        def interrupt(timeout=0):
-            calls["n"] += 1
-            if calls["n"] > 1:                              # la primera es la del plazo; la del paso falla
-                raise GdbError("muerto")
-            return orig(timeout)
-        g.interrupt = interrupt
-        r = pf.check_breakpoints(g, TID, 0.1)
-        self.assertFalse(r.cleanup_ok)
-        self.assertFalse(r.allows_probe)
+        def handle(cmd):
+            if cmd.startswith("Z0,%x" % ALT_A):
+                self.mock.seen.append(cmd)
+                return "E01"
+            return orig(cmd)
+        self.mock._handle = handle
+        r = self.check(alternates=alts(ALT_A, ALT_B))
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE, r.reason)
+        self.assertEqual(len(r.attempts), 2)                # se detiene: no sigue con ALT_B
+        self.assertEqual(r.attempts[1]["respuesta_z0"], "E01")
+        self.assertClean()
 
 
 class TestEntradaYReplicas(Base):
@@ -281,6 +331,9 @@ class ScriptedGdb:
     def drain(self):
         pass
 
+    def read(self, addr, n):
+        return b""
+
     def cmd(self, c):
         self.calls.append(c)
         if c.startswith("z0"):
@@ -297,10 +350,13 @@ class ScriptedGdb:
         self.running = True
 
     def wait_stop(self, timeout=0):
-        if isinstance(self.wait, Exception):
-            raise self.wait
+        w = self.wait
+        if isinstance(w, list):
+            w = w.pop(0) if w else TimeoutError()
+        if isinstance(w, Exception):
+            raise w
         self.running = False
-        return self.stop
+        return w if isinstance(w, str) else self.stop
 
     def interrupt(self, timeout=0):
         self.calls.append("int")
@@ -367,6 +423,110 @@ class TestErrores(unittest.TestCase):
     def test_pass_con_limpieza_fallida_no_autoriza(self):
         r = pf.Result(pf.PASS, "x", PC, cleanup_ok=False)
         self.assertFalse(r.allows_probe)
+
+
+class TestReintentoConDobles(unittest.TestCase):
+    """Dobles sin red: simulados, como todo este archivo."""
+
+    def g(self, **kw):
+        kw.setdefault("wait", [TimeoutError(), TimeoutError()])
+        return ScriptedGdb({"g": g_pkt(PC), "?": "S05"}, **kw)
+
+    def test_error_de_conexion_en_el_reintento_detiene_todo(self):
+        g = self.g(wait=[TimeoutError(), GdbError("conexión cerrada por RPCS3")])
+        r = pf.check_breakpoints(g, TID, 0.1, alternates=alts(ALT_A, ALT_B))
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
+        self.assertIn("conexión cerrada", r.reason)
+        self.assertEqual(len(r.attempts), 2)                # no sigue con ALT_B
+        self.assertIn("z0,30000,4", g.calls)                # intentó limpiar el Z0 del reintento
+        self.assertFalse(r.allows_probe)
+
+    def test_timeout_en_el_reintento_con_interrupcion_fallida_ensucia_la_limpieza(self):
+        g = self.g()
+        n = {"i": 0}
+        orig = g.interrupt
+
+        def interrupt(timeout=0):
+            n["i"] += 1
+            if n["i"] >= 2:                                 # las del reintento (también la de la limpieza)
+                raise GdbError("muerto")
+            return orig(timeout)
+        g.interrupt = interrupt
+        r = pf.check_breakpoints(g, TID, 0.1, alternates=alts(ALT_A))
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE)
+        self.assertFalse(r.cleanup_ok)
+        self.assertFalse(r.allows_probe)
+        self.assertIn("interrupción falló", r.attempts[1]["motivo"])
+
+    def test_el_control_tambien_se_exige_en_el_reintento(self):
+        pcs = iter([PC, PC, PC, PC, ALT_A, ALT_A, ALT_A])    # preámbulo 1, tras interrumpir, candidatas, preámbulo 2, tras la parada...
+        g = ScriptedGdb({"g": lambda c: g_pkt(next(pcs)), "?": "S05"}, wait=[TimeoutError(), "S05", "S05"])   # el control también para
+        r = pf.check_breakpoints(g, TID, 0.1, alternates=alts(ALT_A))
+        self.assertEqual(r.verdict, pf.INCONCLUSIVE, r.reason)
+        self.assertIn("también paró SIN breakpoint", r.reason)
+        self.assertTrue(r.attempts[1]["control"].startswith("paró"))
+        self.assertFalse(r.allows_probe)
+
+    def test_limpieza_fallida_del_primer_intento_impide_reintentar(self):
+        def boom(regs, read):
+            raise AssertionError("no debía buscar alternativas")
+        g = self.g(rm="E01")
+        r = pf.check_breakpoints(g, TID, 0.1, alternates=boom)
+        self.assertEqual(len(r.attempts), 1)
+        self.assertFalse(r.cleanup_ok)
+        self.assertFalse(r.allows_probe)
+        self.assertNotIn("Z0,30000,4", g.calls)
+
+    def test_limpieza_fallida_en_el_reintento_impide_el_sondeo(self):
+        g = self.g(wait=[TimeoutError(), "S05"])
+        seq = iter([True, False, False, False])             # 1.º intento limpia bien; luego no se puede quitar el Z0
+        with mock.patch.object(pf, "_remove", side_effect=lambda *_: next(seq)):
+            r = pf.check_breakpoints(g, TID, 0.1, alternates=alts(ALT_A))
+        self.assertFalse(r.cleanup_ok)
+        self.assertFalse(r.allows_probe)
+
+    def test_cada_intento_queda_registrado_y_serializa(self):
+        g = self.g()
+        r = pf.check_breakpoints(g, TID, 0.1, alternates=alts(ALT_A), attempts=2)
+        d = json.loads(json.dumps(r.to_dict()))
+        for a in d["intentos"]:
+            for k in ("n", "origen", "hilo", "pc", "timeout_s", "veredicto", "motivo", "limpieza_ok", "segundos", "respuesta_z0"):
+                self.assertIn(k, a)
+        self.assertEqual([a["hilo"] for a in d["intentos"]], [TID, TID])
+        self.assertEqual(d["intentos"][0]["pc_tras_interrupcion"], hex(PC))
+        self.assertIn("intento 2", r.report())
+
+    def test_nunca_se_usa_paso_ni_otro_hilo(self):
+        g = self.g()
+        pf.check_breakpoints(g, TID, 0.1, alternates=alts(ALT_A, ALT_B))
+        self.assertNotIn("s", g.calls)
+        self.assertEqual({c for c in g.calls if c.startswith(("Hg", "Hc"))}, {"Hg" + TID, "Hc" + TID})
+
+
+class TestMakeAlternates(unittest.TestCase):
+    """bp_probe.make_alternates: solo direcciones de retorno comprobadas contra el ELF."""
+
+    def setUp(self):
+        # 0x21000: bl (retorno 0x21004 válido); 0x21008: nop (0x2100c NO sigue a una llamada); 0x2100c: bctrl (retorno 0x21010 válido)
+        code = struct.pack(">IIII", 0x48000001, 0x60000000, 0x60000000, 0x4E800421) + struct.pack(">I", 0x60000000)
+        self.img = opd_scan.Image([(0x21000, code)], [(0x21000, 0x21014)])
+
+    def mem(self, d):
+        m = {}
+        for a, v in d.items():
+            m.update({a + i: b for i, b in enumerate(struct.pack(">Q", v))})
+        return lambda addr, n: bytes(m[addr + i] for i in range(n)) if all(addr + i in m for i in range(n)) else b""
+
+    def test_lr_y_cadena_filtrados_y_sin_repetidos(self):
+        read = self.mem({0x1000: 0x1100, 0x1110: 0x21004, 0x1100: 0x1200, 0x1210: 0x2100c})   # ret1 válido, ret2 sin llamada previa
+        out = bp.make_alternates(self.img)({"lr": 0x21010, "r1": 0x1000}, read)
+        self.assertEqual(out, [(0x21010, "lr"), (0x21004, "retorno_1")])        # 0x21010 sigue a bctrl; 0x2100c se descarta
+        out2 = bp.make_alternates(self.img)({"lr": 0x21004, "r1": 0x1000}, read)
+        self.assertEqual(out2, [(0x21004, "lr")])                                # el retorno repetido no se duplica
+
+    def test_lr_fuera_del_elf_o_sin_cadena_no_da_candidatos(self):
+        out = bp.make_alternates(self.img)({"lr": 0x900000, "r1": 0x1000}, lambda a, n: b"")
+        self.assertEqual(out, [])
 
 
 class TestInforme(unittest.TestCase):
@@ -462,6 +622,8 @@ class TestBpProbeExigePass(Base):
         self.assertEqual(ev[0]["evento"], "inicio")
         self.assertEqual(ev[0]["preflight"]["veredicto"], pf.PASS)
         self.assertFalse(ev[0]["preflight"]["ignorado"])
+        att = ev[0]["preflight"]["intentos"]                 # cada intento queda registrado en la salida
+        self.assertEqual((len(att), att[0]["hilo"], att[0]["veredicto"], att[0]["limpieza_ok"]), (1, TID, pf.PASS, True))
 
     def test_ignore_preflight_avisa_y_lo_anota(self):
         rc, err = self.run_probe("--ignore-preflight")
@@ -478,6 +640,23 @@ class TestBpProbeExigePass(Base):
         self.assertEqual(rc, 3)
         self.assertIn("sucio", err)
         self.assertFalse(os.path.exists(self.out))
+
+    def test_bp_probe_entrega_alternativas_validadas_y_sus_intentos(self):
+        seen = {}
+        orig = pf.check_breakpoints
+
+        def spy(*a, **kw):
+            seen.update(kw)
+            seen["pos"] = a
+            return orig(*a, **kw)
+        self.mock.honor_bps = True
+        with mock.patch.object(pf, "check_breakpoints", spy):
+            rc, err = self.run_probe("--preflight-attempts", "2")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(seen["attempts"], 2)
+        self.assertEqual(seen["avoid"].keys(), {0x20018})                    # sus sitios no se pisan
+        self.assertTrue(callable(seen["alternates"]))                        # make_alternates(img): retornos validados contra el ELF
+        self.assertEqual(seen["alternates"]({"lr": 0x1, "r1": 0x1000}, lambda a, n: b""), [])
 
     def test_opciones_nuevas_del_parser(self):
         a = bp_probe.build_parser().parse_args(["--elf", "e", "--sites", "s", "--out", "o"])

@@ -6,7 +6,7 @@ Sirve para responder «¿quién escribe/lee este campo en cada pantalla?» sin r
 **Requisitos:** `PPU Decoder: Interpreter (static)` (con LLVM el servidor acepta `Z0` y nunca para, ver `servidor_gdb_rpcs3.md`), el proxy en marcha, el ELF del programa (descifrado) y un archivo de sitios.
 
 ## Verificación previa
-Antes de poner ningún `Z0` ejecuta `bp_preflight.py` (`docs/bp_preflight.md`) y **no sondea salvo con PASS** (código de salida 3 y sin archivo de salida en otro caso). `--preflight-timeout N`; `--preflight-attempts N` (reintentos avanzando una instrucción); `--ignore-preflight` la salta con aviso y lo anota en el evento `inicio` (no cubre una limpieza fallida).
+Antes de poner ningún `Z0` ejecuta `bp_preflight.py` (`docs/bp_preflight.md`) y **no sondea salvo con PASS** (código de salida 3 y sin archivo de salida en otro caso). `--preflight-timeout N`; `--preflight-attempts N` (reintentos con otra dirección de retorno validada contra el ELF, sin avanzar el hilo); `--ignore-preflight` la salta con aviso y lo anota en el evento `inicio` (no cubre una limpieza fallida).
 
 ## Uso
 ```

@@ -93,6 +93,23 @@ def walk_chain(read, img, r1, depth=3):
     return out
 
 
+def make_alternates(img, depth=3):
+    """Direcciones alternativas para bp_preflight: LR y retornos de la cadena de retroceso del hilo, cada una aceptada solo si cae en
+    el código del ELF y la instrucción anterior es una llamada (bl/bla/bctrl/blrl): la misma comprobación que usa `walk_chain`.
+    Solo lee memoria (el objetivo debe estar detenido); no ejecuta nada del hilo."""
+    def alternates(regs, read):
+        out = []
+        lr = regs.get("lr")
+        if lr is not None and is_call_return(img, lr) is True:
+            out.append((lr, "lr"))
+        for i, fr in enumerate(walk_chain(read, img, regs["r1"], depth), 1):
+            ret = int(fr["ret"], 16)
+            if fr["call"] is True and ret not in [a for a, _ in out]:
+                out.append((ret, "retorno_%d" % i))
+        return out
+    return alternates
+
+
 class RouteLabel:
     """Paso de la ruta en curso: el siguiente al último que `route_run.py` imprimió como terminado en route.log."""
 
@@ -360,7 +377,7 @@ def build_parser():
     ap.add_argument("--cap-site", type=int, default=500)
     ap.add_argument("--port", type=int, default=2346)
     ap.add_argument("--preflight-timeout", type=float, default=5.0, help="s a esperar la parada de la verificación previa (def. %(default)g)")
-    ap.add_argument("--preflight-attempts", type=int, default=bp_preflight.DEFAULT_ATTEMPTS, help="intentos de la verificación previa (entre intentos el hilo avanza una instrucción; def. %(default)d)")
+    ap.add_argument("--preflight-attempts", type=int, default=bp_preflight.DEFAULT_ATTEMPTS, help="intentos de la verificación previa; los reintentos usan otra dirección de retorno del hilo validada contra el ELF (def. %(default)d; 1 = sin reintentos)")
     ap.add_argument("--ignore-preflight", action="store_true", help="seguir aunque la verificación previa no dé PASS (aviso + anotado en la salida); no cubre una limpieza fallida")
     return ap
 
@@ -382,7 +399,7 @@ def main(argv):
     label = RouteLabel(a.route, a.route_log) if a.route and a.route_log else (FileLabel(a.label_file) if a.label_file else None)
     g = Gdb("127.0.0.1", a.port, timeout=30.0)
     pre = bp_preflight.check_breakpoints(g, tid, a.preflight_timeout, avoid=sites, is_code=img.in_code,
-                                        attempts=a.preflight_attempts)
+                                        attempts=a.preflight_attempts, alternates=make_alternates(img))
     print(pre.report(), file=sys.stderr)
     if not pre.cleanup_ok:
         print("error: la verificación previa dejó el estado sucio; no se continúa (ni con --ignore-preflight)", file=sys.stderr)
@@ -397,7 +414,7 @@ def main(argv):
     g.cmd("Hc" + tid)
     with open(a.out, "x", encoding="utf-8") as out:
         p = Probe(g, img, sites, tid, out, label, a.cap_key, a.cap_site, parse_dumps(a.dump), a.all_regs, a.object_vtable)
-        p.emit({"evento": "inicio", "preflight": {"veredicto": pre.verdict, "motivo": pre.reason, "ignorado": bool(a.ignore_preflight and not pre.allows_probe)},
+        p.emit({"evento": "inicio", "preflight": dict(pre.to_dict(), ignorado=bool(a.ignore_preflight and not pre.allows_probe)),
                 "hilo": tid, "sitios": {hex(v): d for v, d in sites.items()}, "cap_key": a.cap_key, "cap_site": a.cap_site})
         for va in sites:
             if not g.bp(va):
