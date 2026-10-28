@@ -72,4 +72,46 @@ Los seis `RPCS3.log` (cuatro finales del proceso y dos copias tomadas al termina
 - **Hipótesis:** los INCONCLUSIVE del intérprete son paradas silenciosas o un hilo bloqueado (el protocolo no los distingue); el resultado del intérprete depende del momento de ejecución (1/3 PASS en la
   tanda 2, 6/6 en la 3).
 - **Confirmado (tandas 5–6, n=12):** el reintento actual se ejecutó una vez en RPCS3 real (LLVM): 3 intentos, todos INCONCLUSIVE, limpieza correcta, sin `s`.
-- **Pendiente:** un reintento real que termine en PASS; un caso real en que el intérprete necesite reintento; otros hilos y pantallas; más corridas.
+- **Pendiente:** un reintento real que termine en PASS (no reproducible hasta ahora; ver la tanda 7); otros hilos y pantallas; más corridas; registrar la instrucción del PC en cada intento para poder correlacionar con `sc`.
+
+## Tanda 7 (2026-10-28): muestreo amplio del intérprete y experimento de memoria
+**Objetivo:** comprobar si la ruta «INCONCLUSIVE por PC sin cambios → reintento → PASS» aparece de forma natural, sin tocar RPCS3 ni relajar criterios.
+**Método:** un arranque con el intérprete, `bp_preflight.py --elf <ELF original> --timeout 8 --attempts 3 --json`, **101 corridas** seguidas entre `t+18 s` y `t+495 s` desde que apareció `GameThread`. Código: `add003a` más `--json`
+y el arreglo de Ctrl-C (este último aplicado mientras corría; no altera el camino normal). Contexto: arranque en frío; a ~60 s el vídeo de logos y a ~400 s una escena con cuadro de diálogo (no se sabe si es modo demostración).
+
+| Resultado | Corridas |
+|---|---|
+| PASS en el primer intento | 97 (25 PC distintos) |
+| INCONCLUSIVE: PC fuera del código del ELF (sin `Z0` puesto, no reintentable) | 4 |
+| INCONCLUSIVE por PC sin cambios | **0** |
+
+**La ruta INCONCLUSIVE → reintento → PASS no se ha demostrado en RPCS3 real.** Prerrequisito que falta: un primer intento reproducible que termine en «timeout con el PC sin cambios». Con el intérprete ocurrió 2 veces en 116
+primeros intentos (ambas en la tanda 2) y 0 veces en las 113 corridas posteriores (tandas 3, 5 y 7). Provocarlo exigiría manipular el escenario o RPCS3, o forzar un resultado que el criterio no concede; no se hizo.
+La única ejecución real del reintento es la de la tanda 6 (LLVM, 3 intentos, todos INCONCLUSIVE, sin PASS).
+
+### Tipo de instrucción en el PC probado
+Se decodificó (del ELF original, fuera de este repo) la instrucción en cada PC probado. Primer intento, todas las tandas; el reintento con `s` (retirado) se cuenta aparte.
+
+| Decoder | Instrucción en el PC | PASS | FAIL | INCONCLUSIVE |
+|---|---|---|---|---|
+| Intérprete | llamada al sistema (`sc`) | 84 | 0 | 2 (por PC sin cambios; ambos en `sc`) |
+| Intérprete | otra | 26 | 0 | 0 |
+| Intérprete | fuera del ELF | — | — | 4 (sin `Z0`) |
+| LLVM | `sc` | 0 | 10 | 1 |
+| LLVM | otra | 0 | 1 | 0 |
+| LLVM, tras el paso con `s` (retirado) | otra | 0 | 2 | 0 |
+
+- Hay 7 PC probados con **ambos** decoders (4 de tipo `sc`, 3 de otro tipo). En los 3 de otro tipo: intérprete PASS (4 veces en total), LLVM FAIL (1 de primer intento y 2 tras el paso retirado).
+
+### Experimento de caja negra: ¿el `Z0` cambia la memoria?
+Con el intérprete, 8 rondas: se lee con `m` la memoria alrededor del PC antes del `Z0`, después y tras el `z0`. **En 8 de 8 rondas es idéntica**, el `Z0` y el `z0` contestan `OK` y el PC no cambia. **Este método no puede distinguir
+«rechazado» de «instalado y ignorado»** y tampoco permitiría detectar un breakpoint del depurador Qt comparando contra el ELF. No se repitió con LLVM porque no aportaría información.
+
+### Qué se sabe y qué no del contraste intérprete / LLVM
+- **Confirmado (n chico, un hilo, un contexto):** con LLVM el servidor contestó `OK` al `Z0` en las 15 corridas y en 13 corridas decisivas el hilo siguió más allá del PC sin parar; con el intérprete los mismos PC paran (110 PASS).
+  En cada FAIL el hilo avanzó: **una parada silenciosa no explica esos FAIL**. Hay FAIL de LLVM en instrucciones que no son `sc` y PC no-`sc` con PASS (intérprete) y FAIL (LLVM).
+- **Hipótesis, sin descartar:** (a) `ppu_breakpoint` rechaza el `Z0` con LLVM (lectura de código de una sesión previa, `servidor_gdb_rpcs3.md` regla 3; no releída en esta tarea); (b) el código LLVM ya compilado no consulta la
+  tabla de breakpoints; (c) con LLVM el PC de una parada podría no ser «la próxima instrucción a ejecutar», sobre todo en un `sc` (10 de 11 FAIL de primer intento caen en un `sc`); (d) efecto del momento o del estado del juego.
+  (c) no explica el FAIL de primer intento fuera de `sc` (n=1) ni los 2 posteriores al paso retirado, pero esas muestras son demasiado pequeñas para descartarla.
+- **Desconocido:** la causa; si algún ajuste de RPCS3 hace que LLVM respete los breakpoints; qué ocurre con otros hilos, pantallas o versiones. **No se afirma que LLVM carezca de breakpoints en general.**
+- Los 2 INCONCLUSIVE del intérprete por PC sin cambios caen en `sc`: compatible con un hilo bloqueado dentro de la llamada (hipótesis, no demostrado).

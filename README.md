@@ -34,7 +34,7 @@ Un `Z0` aceptado **no prueba que el breakpoint funcione**: el servidor de RPCS3 
 ```
 python3 -I tests/run_all.py --min-tests 100
 ```
-Corre cada suite en su proceso y **falla si algún test se omite**: ninguna depende de un programa real (hay un ELF sintético en `tests/fixtures/`). Estado actual: 130 tests (proxy 18, bp_probe 24, bp_preflight 53, opd_scan 11, herramientas 9, escáner de fugas 15). Los de `bp_preflight` usan un servidor simulado (Gdb → proxy → `mock_rsp.py`): no sustituyen una corrida contra RPCS3 real.
+Corre cada suite en su proceso y **falla si algún test se omite**: ninguna depende de un programa real (hay un ELF sintético en `tests/fixtures/`). Estado actual: 132 tests (proxy 18, bp_probe 24, bp_preflight 55, opd_scan 11, herramientas 9, escáner de fugas 15). Los de `bp_preflight` usan un servidor simulado (Gdb → proxy → `mock_rsp.py`): no sustituyen una corrida contra RPCS3 real.
 
 ## Aviso sobre el historial
 Este repo se extrajo del historial de un proyecto de traducción de un juego de PS3 (se conservaron los commits de estos archivos y se reescribieron sus mensajes). **Las versiones antiguas del código contienen constantes de ese binario** (direcciones y offsets de funciones y estructuras), no datos del juego: no hay ejecutables, volcados, capturas ni texto del juego en ninguna revisión (comprobado con `tools/check_no_game_data.py`: árbol y todos los blobs del historial). El estado actual no contiene esas constantes. El autor de los commits figura con su nombre y correo.

@@ -25,11 +25,12 @@ intento alternativo SOLO puede dar PASS o INCONCLUSIVE: que el hilo no pare o se
 no hay FAIL por reintento. No avanza el hilo con `s`, no cambia de hilo y no suma al PC.
 
 Uso: python3 -I bp_preflight.py (--thread <id_hex> | --log RPCS3.log [--thread-name GameThread]) [--elf programa.elf | --code lo-hi]
-         [--timeout 5] [--attempts 3] [--no-control] [--no-resume] [--port 2346]
-`--timeout` es por intento; cota total ≈ attempts × (timeout + CONTROL_TIMEOUT + limpieza). Los reintentos con direcciones de retorno
+         [--timeout 5] [--attempts 3] [--no-control] [--no-resume] [--json salida.json] [--port 2346]
+`--json` guarda el resultado completo (un registro por intento; el archivo no debe existir). `--timeout` es por intento; cota total ≈ attempts × (timeout + CONTROL_TIMEOUT + limpieza). Los reintentos con direcciones de retorno
 exigen --elf. Código de salida: 0 PASS, 1 FAIL, 3 INCONCLUSIVE, 2 uso incorrecto.
 """
 import argparse
+import json
 import re
 import sys
 import os
@@ -164,6 +165,9 @@ def _attempt(g, tid, timeout, avoid, is_code, control, target, origen, n, record
         res = _run(g, tid, timeout, avoid, is_code, control, state, target)
     except (GdbError, OSError, ValueError) as e:       # TimeoutError es OSError
         res = Result(INCONCLUSIVE, "error de conexión o de protocolo: %s: %s" % (type(e).__name__, e), state["addr"])
+    except BaseException:                              # p. ej. Ctrl-C con el Z0 puesto y el objetivo en marcha: limpiar y propagar
+        _cleanup(g, state, Result(INCONCLUSIVE, "interrumpido"))
+        raise
     res.cleanup_ok = _cleanup(g, state, res)
     rec = {"n": n, "origen": origen, "hilo": tid, "pc": hex(res.address) if res.address is not None else None, "timeout_s": timeout,
            "veredicto": res.verdict, "motivo": res.reason, "limpieza_ok": res.cleanup_ok, "reintentable": res.retryable,
@@ -289,6 +293,7 @@ def build_parser():
     ap.add_argument("--attempts", type=int, default=DEFAULT_ATTEMPTS, help="intentos en total; los reintentos usan otra dirección de retorno del hilo validada contra el ELF (def. %(default)s; 1 = sin reintentos)")
     ap.add_argument("--no-control", action="store_true", help="omitir el control sin breakpoint")
     ap.add_argument("--no-resume", action="store_true", help="dejar el objetivo detenido al terminar")
+    ap.add_argument("--json", help="guardar el resultado completo, con un registro por intento (no debe existir)")
     ap.add_argument("--port", type=int, default=2346)
     return ap
 
@@ -301,6 +306,9 @@ def main(argv):
     from bp_probe import find_game_thread, make_alternates
     import opd_scan
     import validate_server
+    if a.json and os.path.exists(a.json):
+        print("error: %s ya existe" % a.json, file=sys.stderr)
+        return 2
     tid = a.thread.zfill(16) if a.thread else find_game_thread(a.log, a.thread_name)
     ranges = validate_server.set_code_ranges(a.elf, a.code)
     alternates = make_alternates(opd_scan.Image.from_elf(a.elf)) if a.elf else None
@@ -308,6 +316,9 @@ def main(argv):
     res = check_breakpoints(g, tid, a.timeout, is_code=validate_server.in_code if ranges else None,
                             control=not a.no_control, resume=not a.no_resume, attempts=a.attempts, alternates=alternates)
     print(res.report())
+    if a.json:
+        with open(a.json, "x", encoding="utf-8") as f:
+            json.dump(dict(res.to_dict(), hilo=tid, codigo_salida=EXIT_CODES[res.verdict], t_fin=time.time()), f, ensure_ascii=False, indent=1)
     return EXIT_CODES[res.verdict]
 
 

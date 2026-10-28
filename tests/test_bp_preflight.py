@@ -420,6 +420,17 @@ class TestErrores(unittest.TestCase):
         self.assertEqual(r.verdict, pf.INCONCLUSIVE)
         self.assertFalse(r.cleanup_ok)
 
+    def test_ctrl_c_con_el_z0_puesto_limpia_y_propaga(self):
+        class G(ScriptedGdb):
+            def wait_stop(self, timeout=0):
+                raise KeyboardInterrupt()                    # el usuario interrumpe mientras el objetivo corre con el Z0 puesto
+        g = G({"g": g_pkt(PC), "?": "S05"})
+        with self.assertRaises(KeyboardInterrupt):
+            pf.check_breakpoints(g, TID, 0.1)
+        self.assertIn("int", g.calls)                       # paró el objetivo...
+        self.assertIn("z0,20010,4", g.calls)                # ...y quitó el Z0 antes de salir
+        self.assertFalse(g.running)
+
     def test_pass_con_limpieza_fallida_no_autoriza(self):
         r = pf.Result(pf.PASS, "x", PC, cleanup_ok=False)
         self.assertFalse(r.allows_probe)
@@ -557,6 +568,18 @@ class TestCli(Base):
         self.mock.reject_z0 = True
         rc, out = self.run_main()
         self.assertEqual(rc, 1)
+
+    def test_cli_json_guarda_un_registro_por_intento_y_no_sobrescribe(self):
+        self.mock.honor_bps = True
+        p = os.path.join(self.tmp.name, "r.json")
+        rc, out = self.run_main("--json", p)
+        self.assertEqual(rc, 0)
+        d = json.load(open(p, encoding="utf-8"))
+        self.assertEqual((d["veredicto"], d["codigo_salida"], d["hilo"], len(d["intentos"])), (pf.PASS, 0, TID, 1))
+        self.assertEqual(d["intentos"][0]["respuesta_z0"], "OK")
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc2, _ = self.run_main("--json", p)               # ya existe: no se sobrescribe ni se toca el objetivo
+        self.assertEqual(rc2, 2)
 
     def test_cli_exige_hilo_o_log(self):
         with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):

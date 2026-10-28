@@ -6,8 +6,9 @@ Un `Z0` aceptado **no prueba nada**: `cmd_set_breakpoint` contesta `OK` siempre 
 ```
 # con el proxy en marcha y el juego en la pantalla que interesa (conectar pausa el emulador)
 python3 -I bp_preflight.py (--thread <id_hex> | --log RPCS3.log [--thread-name GameThread]) [--elf programa.elf | --code lo-hi]
-    [--timeout 5] [--attempts 3] [--no-control] [--no-resume] [--port 2346]
+    [--timeout 5] [--attempts 3] [--no-control] [--no-resume] [--json salida.json] [--port 2346]
 ```
+`--json` guarda el resultado completo (un registro por intento, hilo, código de salida); el archivo no debe existir.
 Código de salida: **0 PASS · 1 FAIL · 3 INCONCLUSIVE** · 2 uso incorrecto. Por defecto reanuda el objetivo al terminar con limpieza correcta (`--no-resume` lo deja detenido). Debe correr con el objetivo **detenido** (estado al conectar el proxy): si está en marcha devuelve INCONCLUSIVE sin tocar nada.
 `--timeout` es **por intento**; cota total aproximada: `attempts × (timeout + 1 s de control + limpieza)`.
 Como módulo: `bp_preflight.check_breakpoints(g, tid, timeout, avoid=(), is_code=None, control=True, resume=False, attempts=3, alternates=None)` devuelve un `Result` (`verdict`, `reason`, `address`, `cleanup_ok`, `allows_probe`, `notes`, `attempts`, `to_dict()`).
@@ -18,7 +19,7 @@ Como módulo: `bp_preflight.check_breakpoints(g, tid, timeout, avoid=(), is_code
 3. `Z0` en el PC → `c` → espera una parada hasta `--timeout`.
 4. Con la parada: exige señal `05` y que el PC del hilo siga siendo el del breakpoint. **Control:** quita el `Z0`, continúa de nuevo ~1 s y exige que **no** pare; así la parada se atribuye al `Z0` y no a un servidor que para siempre.
 5. Sin parada: interrumpe (`0x03`) y mira el PC. Si el hilo **avanzó** (ejecutó la instrucción con el `Z0` puesto sin parar) es FAIL; si sigue en el mismo PC no hay evidencia suficiente (INCONCLUSIVE).
-6. Siempre intenta quitar el `Z0` (parando antes el objetivo si hace falta) y confirma el `z0`. Si no pudo, `cleanup_ok = False`: el resultado nunca autoriza un sondeo.
+6. Siempre intenta quitar el `Z0` (parando antes el objetivo si hace falta) y confirma el `z0`, también ante Ctrl-C u otra excepción (limpia y la propaga). Si no pudo, `cleanup_ok = False`: el resultado nunca autoriza un sondeo.
 
 ## Reintentos (otra dirección, validada; sin pasos ni cambio de hilo)
 Solo el caso «plazo vencido y el hilo sigue en el mismo PC» (parada silenciosa o hilo bloqueado: el protocolo no los distingue) permite otro intento, y solo si la limpieza del anterior salió bien y quedan intentos (`--attempts`, 3 por defecto en total; `1` los desactiva).
@@ -42,12 +43,13 @@ Solo el caso «plazo vencido y el hilo sigue en el mismo PC» (parada silenciosa
 - Otros decoders o versiones de RPCS3: sin probar. Cualquier cosa distinta de PASS se trata como «no apto» para `bp_probe.py`.
 
 ## Validación
-- **Simulada:** `tests/test_bp_preflight.py` (53 tests) usa `mock_rsp.py` (Gdb real → `proxy.py` real → servidor simulado que imita las reglas leídas en el código de RPCS3) y dobles sin red. Demuestran la lógica de decisión, **no** el comportamiento de RPCS3.
-- **Real:** corridas puntuales con RPCS3 0.0.43 (intérprete y LLVM), con muestra chica y sin estadística: `docs/evidencia/preflight_rpcs3_0.0.43/README.md`. El reintento actual (direcciones de retorno) se ejecutó **una sola vez** contra RPCS3 real (LLVM, 3 intentos, todos INCONCLUSIVE); **ningún reintento real ha terminado en PASS** ni se ha visto uno con el intérprete.
+- **Simulada:** `tests/test_bp_preflight.py` (55 tests) usa `mock_rsp.py` (Gdb real → `proxy.py` real → servidor simulado que imita las reglas leídas en el código de RPCS3) y dobles sin red. Demuestran la lógica de decisión, **no** el comportamiento de RPCS3.
+- **Real:** corridas puntuales con RPCS3 0.0.43 (intérprete y LLVM), con muestra chica y sin estadística: `docs/evidencia/preflight_rpcs3_0.0.43/README.md`. El reintento actual (direcciones de retorno) se ejecutó **una sola vez** contra RPCS3 real (LLVM, 3 intentos, todos INCONCLUSIVE); **ningún reintento real ha terminado en PASS**, y en 101 corridas amplias del intérprete (tanda 7) no hizo falta ninguno. No se mezclan resultados simulados y reales en una misma tasa.
 
 ## Límites (no resolubles sin cambiar RPCS3 o el protocolo)
+- **FAIL en un `sc`:** el FAIL supone que el hilo no había ejecutado aún la instrucción del PC. Con el intérprete eso se sostiene (84 PASS en `sc`), pero con LLVM no está comprobado: un hilo parado en un `sc` podría ir ya dentro de la llamada. Casi todos los FAIL de LLVM observados caen en un `sc` (hay uno fuera de `sc`, n=1). Hipótesis abierta; ver el informe de evidencia.
 - La premisa «con un `Z0` en el PC actual, `c` vuelve a parar al instante» se apoya en la medición de la regla 4 (0,08 s, 5 de 5 ciclos, dos direcciones) y en las corridas del informe, no en una garantía.
-- **Breakpoints ajenos:** el servidor no permite listar breakpoints. Si el hilo está parado justo en un breakpoint puesto desde el depurador Qt de RPCS3, el `z0` de limpieza lo quitaría. Correr la verificación antes de poner breakpoints propios o del depurador.
+- **Breakpoints ajenos:** el servidor no permite listar breakpoints, y se midió que el `Z0` no deja huella en la memoria visible con `m`, así que tampoco se detectan comparando con el ELF. Si el hilo está parado justo en un breakpoint puesto desde el depurador Qt de RPCS3, el `z0` de limpieza lo quitaría. Correr la verificación antes de poner breakpoints propios o del depurador.
 - **Un solo hilo:** valida el hilo elegido. Una parada que llega de otro hilo se informa como INCONCLUSIVE.
 - **Parada silenciosa frente a hilo bloqueado:** indistinguibles con este protocolo; ambos dan INCONCLUSIVE, nunca PASS. `bp_probe.py` trata las silenciosas con su vigía; la verificación no.
 - **Direcciones de retorno:** que una dirección de retorno sea código válido no garantiza que el hilo vuelva a pasar por ella pronto; un hilo ocioso puede agotar los intentos.
