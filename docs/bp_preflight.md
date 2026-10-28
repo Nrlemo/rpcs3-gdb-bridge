@@ -43,7 +43,7 @@ Solo el caso «plazo vencido y el hilo sigue en el mismo PC» (parada silenciosa
 
 ## Validación
 - **Simulada:** `tests/test_bp_preflight.py` (53 tests) usa `mock_rsp.py` (Gdb real → `proxy.py` real → servidor simulado que imita las reglas leídas en el código de RPCS3) y dobles sin red. Demuestran la lógica de decisión, **no** el comportamiento de RPCS3.
-- **Real:** corridas puntuales con RPCS3 0.0.43 (intérprete y LLVM), con muestra chica y sin estadística: `docs/evidencia/preflight_rpcs3_0.0.43/README.md`. **El reintento actual (direcciones de retorno) no se ha corrido contra RPCS3 real.**
+- **Real:** corridas puntuales con RPCS3 0.0.43 (intérprete y LLVM), con muestra chica y sin estadística: `docs/evidencia/preflight_rpcs3_0.0.43/README.md`. El reintento actual (direcciones de retorno) se ejecutó **una sola vez** contra RPCS3 real (LLVM, 3 intentos, todos INCONCLUSIVE); **ningún reintento real ha terminado en PASS** ni se ha visto uno con el intérprete.
 
 ## Límites (no resolubles sin cambiar RPCS3 o el protocolo)
 - La premisa «con un `Z0` en el PC actual, `c` vuelve a parar al instante» se apoya en la medición de la regla 4 (0,08 s, 5 de 5 ciclos, dos direcciones) y en las corridas del informe, no en una garantía.

@@ -18,9 +18,11 @@ repo del proyecto que consume el bridge (`docs/evidencia/preflight_bp/`), no aqu
 | 2 | Intérprete | 3 | `34c1584` (sin reintento) |
 | 3 | Intérprete | 6 | `11df8a9` (reintento avanzando con `s`; **retirado**) |
 | 4 | LLVM | 6 | `11df8a9` (ídem) |
+| 5 | Intérprete | 6 | `d5d5b92` (reintento actual; `--elf`) |
+| 6 | LLVM | 6 | `d5d5b92` (ídem) |
 
 Las tandas 3 y 4 usaron un reintento que avanzaba el hilo con `s`. Esa lógica se sustituyó por la de `docs/bp_preflight.md` (otra dirección de retorno validada, sin `s`). El primer intento
-de todas las tandas es el mismo; **el reintento actual no corrió en ninguna**.
+de todas las tandas es el mismo; el reintento actual (tandas 5 y 6) se ejecutó con `--elf` (el ELF original descifrado).
 
 ## Resultados por corrida
 | Tanda | # | PC | Veredicto | Evidencia en la salida |
@@ -35,18 +37,21 @@ de todas las tandas es el mismo; **el reintento actual no corrió en ninguna**.
 | 4 LLVM | 1, 3, 4, 5 | PC-D, PC-B, PC-D, PC-A | 4 × **FAIL** | el hilo avanzó sin parar |
 | 4 LLVM | 2 | PC-B → PC-E | **FAIL** | intento 1 INCONCLUSIVE; paso con `s` (retirado); intento 2 FAIL |
 | 4 LLVM | 6 | PC-G → PC-H | **FAIL** | ídem |
+| 5 Interp. | 1–6 | PC-A ×6 | 6 × **PASS** | 0 reintentos |
+| 6 LLVM | 1, 2, 4, 5, 6 | PC-K, PC-A, PC-A, PC-A, PC-F | 5 × **FAIL** | el hilo avanzó sin parar |
+| 6 LLVM | 3 | PC-D → PC-I (LR) → PC-J (retorno 1) | INCONCLUSIVE | **3 intentos** sin parada en 8 s; limpieza correcta en cada uno; límite de intentos alcanzado; sin `s` ni cambio de hilo |
 
 ## Comparación
 | | LLVM (tandas 1 y 4) | Intérprete (tandas 2 y 3) |
 |---|---|---|
-| Corridas | 9 | 9 |
-| PASS | 0 | 7 |
-| FAIL | 8 (2 de ellos tras el reintento con `s`, retirado) | 0 |
-| INCONCLUSIVE | 1 | 2 |
+| Corridas (tandas 1–6) | 15 | 15 |
+| PASS | 0 | 13 |
+| FAIL | 13 (2 de ellos tras el reintento con `s`, retirado) | 0 |
+| INCONCLUSIVE | 2 | 2 |
 
-- **El mismo PC (PC-A) dio resultados opuestos según el decoder:** con LLVM, FAIL (tanda 1, corrida 1) e INCONCLUSIVE (tanda 1, corrida 3); con el intérprete, PASS (tanda 2, corrida 2 y cuatro veces en la tanda 3).
+- **El mismo PC (PC-A) dio resultados opuestos según el decoder:** con LLVM, FAIL (tanda 1, corrida 1) e INCONCLUSIVE (tanda 1, corrida 3); con el intérprete, PASS (tanda 2, corrida 2; cuatro veces en la tanda 3; seis en la tanda 5). Con LLVM, la tanda 6 repitió FAIL en PC-A (3 de 3).
 - Es el patrón que predice el código de RPCS3 (`ppu_breakpoint` rechaza LLVM; `servidor_gdb_rpcs3.md`, regla 3), pero **no lo demuestra** con esta muestra.
-- Ningún PASS con LLVM y ningún FAIL con el intérprete en estas 18 corridas. Eso no establece una tasa de falsos positivos.
+- Ningún PASS con LLVM y ningún FAIL con el intérprete en estas 30 corridas. Eso no establece una tasa de falsos positivos.
 
 ## Evidencia de protocolo (del registro del proxy)
 | Tanda | `Z0` | `z0` | `vCont;c` | `vCont;s` |
@@ -55,13 +60,16 @@ de todas las tandas es el mismo; **el reintento actual no corrió en ninguna**.
 | 2 | 3 | 3 | 7 | 0 |
 | 3 | 6 | 6 | 18 | 0 |
 | 4 | 8 | 8 | 14 | 2 |
+| 5 | 6 | 6 | 18 | 0 |
+| 6 | 8 | 8 | 14 | 0 |
 
 Cada `Z0` tiene su `z0`; el número de `vCont;c` es coherente con el ciclo de cada corrida (prueba, control si hubo parada, reanudación final). **No disponible:** el paquete de parada de cada PASS
 de las tandas 1–2 (el código de entonces no lo imprimía; consta en el JSONL del proxy sin atribución por corrida) ni el PC tras la parada. No se registraron los PC de los demás hilos.
-Los cuatro `RPCS3.log` finales se revisaron solo con `grep`: 0 `Access violation` y 0 `frozen` en cada uno; no se leyeron enteros y no están en este repo.
+Los seis `RPCS3.log` (cuatro finales del proceso y dos copias tomadas al terminar las corridas de las tandas 5 y 6) se revisaron solo con `grep`: 0 `Access violation` y 0 `frozen` en cada uno; no se leyeron enteros y no están en este repo.
 
 ## Confirmado / hipótesis / pendiente
 - **Confirmado (n chico):** el veredicto de cada corrida, la coherencia de los paquetes `Z0`/`z0`/`vCont`, y que un PASS exigió parada con señal 05 en el PC más control sin parada.
 - **Hipótesis:** los INCONCLUSIVE del intérprete son paradas silenciosas o un hilo bloqueado (el protocolo no los distingue); el resultado del intérprete depende del momento de ejecución (1/3 PASS en la
   tanda 2, 6/6 en la 3).
-- **Pendiente:** correr contra RPCS3 real el reintento actual (`bp_probe.make_alternates`); otros hilos y pantallas; más corridas.
+- **Confirmado (tandas 5–6, n=12):** el reintento actual se ejecutó una vez en RPCS3 real (LLVM): 3 intentos, todos INCONCLUSIVE, limpieza correcta, sin `s`.
+- **Pendiente:** un reintento real que termine en PASS; un caso real en que el intérprete necesite reintento; otros hilos y pantallas; más corridas.
